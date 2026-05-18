@@ -152,6 +152,12 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 			conf.Shared.IsShared = false
 			conf.Shared.SharedError = "No secret in config file"
 		} else {
+			var hostCount int64
+			if err := db.Table("teldrive.group_members").Where("status = ?", "host").Count(&hostCount).Error; err == nil && hostCount > 1 {
+				lg.Warn("multi-host split-brain detected, self-healing by truncating group_members table")
+				db.Exec("TRUNCATE TABLE teldrive.group_members CASCADE")
+			}
+
 			var hostMember models.GroupMember
 			err := db.Table("teldrive.group_members").Where("status = ?", "host").First(&hostMember).Error
 			if err == nil {
