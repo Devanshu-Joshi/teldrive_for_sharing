@@ -183,6 +183,17 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 		zap.Int64("size", params.ContentLength),
 	)
 
+	// This is ORIGINAL roadmap EPIC 5 — Phase 21A
+	// Read-only Upload Channel Resolution
+	var intendedHostChannelId int64
+	if a.cnf.Shared.IsShared {
+		_, hostChannelId := auth.GetUserGroup(ctx, a.db, true)
+		intendedHostChannelId = hostChannelId
+		logger.Info("Phase 21A Upload Intended Routing Resolution",
+			zap.Int64("caller_id", userId),
+			zap.Int64("intended_host_channel_id", intendedHostChannelId))
+	}
+
 	channelId := params.ChannelId.Value
 	if channelId == 0 {
 		var err error
