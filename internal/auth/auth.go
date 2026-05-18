@@ -50,6 +50,46 @@ func GetUser(c context.Context) int64 {
 	return userId
 }
 
+// GetUserGroup retrieves the active group member user IDs (up to 50) and the Host's Channel ID.
+func GetUserGroup(c context.Context, db *gorm.DB, isShared bool) ([]int64, int64) {
+	userId := GetUser(c)
+	if userId == 0 {
+		return []int64{0}, 0
+	}
+	if !isShared {
+		return []int64{userId}, 0
+	}
+
+	var status string
+	var hostId int64
+
+	err := db.Model(&models.GroupMember{}).Select("host_id", "status").Where("member_id = ?", userId).Row().Scan(&hostId, &status)
+	if err != nil {
+		return []int64{userId}, 0 // Pending or un-affiliated
+	}
+
+	var channelId int64
+	db.Model(&models.GroupMember{}).Select("channel_id").Where("member_id = ? AND status = 'host'", hostId).Row().Scan(&channelId)
+
+	var groupIds []int64
+	if status == "approved" {
+		db.Model(&models.GroupMember{}).Where("host_id = ? AND status = 'approved'", hostId).
+			Order("created_at ASC").Pluck("member_id", &groupIds)
+	} else if status == "host" {
+		hostId = userId
+		db.Model(&models.GroupMember{}).Where("host_id = ? AND status = 'approved'", userId).
+			Order("created_at ASC").Pluck("member_id", &groupIds)
+	}
+
+	finalIds := []int64{hostId}
+	finalIds = append(finalIds, groupIds...)
+
+	if len(finalIds) > 50 {
+		return finalIds[:50], channelId
+	}
+	return finalIds, channelId
+}
+
 func GetJWTUser(c context.Context) *types.JWTClaims {
 	authUser, ok := c.Value(authKey).(*types.JWTClaims)
 	if !ok {
