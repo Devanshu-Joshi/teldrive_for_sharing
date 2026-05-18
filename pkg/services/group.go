@@ -374,8 +374,45 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 	})
 }
 
-// LeaveGroup handles DELETE /api/group/leave - placeholder for next phase
+// LeaveGroup handles DELETE /api/group/leave - Guest leaves or Host resigns the group.
 func (e *extendedService) LeaveGroup(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
-	w.WriteHeader(http.StatusNotImplemented)
-	w.Write([]byte(`{"error": "Not implemented in this phase"}`))
+	// Execute the entire flow inside an explicit database transaction
+	err := e.api.db.Transaction(func(tx *gorm.DB) error {
+		// 1. Fetch the caller's membership status with a write lock to prevent concurrency races
+		var callerMember models.GroupMember
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("member_id = ?", userId).First(&callerMember).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("you are not a member of any group")
+			}
+			return err
+		}
+
+		// 2. Branch based on status: Host Resignation vs Guest Leave
+		if callerMember.Status == "host" {
+			// Host Resignation Flow
+			// Wipes out the ENTIRE group membership table to completely dismantle the group.
+			// We use DELETE instead of TRUNCATE for superior transactional safety, GORM lifecycle compatibility,
+			// and to avoid table-level lockups caused by ACCESS EXCLUSIVE locks.
+			if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&models.GroupMember{}).Error; err != nil {
+				return err
+			}
+		} else {
+			// Guest Leave Flow (Approved or Pending guests)
+			// Delete ONLY the caller's membership row
+			if err := tx.Where("member_id = ?", userId).Delete(&models.GroupMember{}).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error": "` + err.Error() + `"}`))
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status": "Success", "message": "Successfully left the group or dismantled it"}`))
 }
