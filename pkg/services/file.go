@@ -601,7 +601,7 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 		}
 
 		// Rewrite the query scope by unsetting ParentId to query the host's physical root
-		params.ParentId.SetTo("")
+		params.ParentId.SetTo("nil")
 
 		queryBuilder := &fileQueryBuilder{db: a.db}
 		return queryBuilder.execute(&params, hostID)
