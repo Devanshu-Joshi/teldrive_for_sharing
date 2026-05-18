@@ -727,6 +727,27 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 		destParentID = &req.DestinationParent
 	}
 
+	var srcFile models.File
+	if err := a.db.Model(&models.File{}).Where("id = ?", req.Ids[0]).First(&srcFile).Error; err != nil {
+		return &apiError{err: err}
+	}
+	srcOwner := srcFile.UserId
+
+	var destOwner int64
+	if destParentID == nil || *destParentID == "" || *destParentID == "00000000-0000-0000-0000-000000000000" {
+		destOwner = userId
+	} else {
+		var destFile models.File
+		if err := a.db.Model(&models.File{}).Where("id = ?", *destParentID).First(&destFile).Error; err != nil {
+			return &apiError{err: err}
+		}
+		destOwner = destFile.UserId
+	}
+
+	if srcOwner != destOwner {
+		return &apiError{err: errors.New("cannot move files across different partition owners"), code: 403}
+	}
+
 	err := a.db.Transaction(func(tx *gorm.DB) error {
 		var srcFile models.File
 		if err := tx.Where("id = ? AND user_id = ?", req.Ids[0], userId).First(&srcFile).Error; err != nil {
