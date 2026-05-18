@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/chizap"
 	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/tgdrive/teldrive/internal/crypt"
 	"github.com/tgdrive/teldrive/internal/database"
 	"github.com/tgdrive/teldrive/internal/events"
 	"github.com/tgdrive/teldrive/internal/logging"
@@ -32,6 +34,7 @@ import (
 	"github.com/tgdrive/teldrive/ui"
 
 	"github.com/tgdrive/teldrive/pkg/cron"
+	"github.com/tgdrive/teldrive/pkg/models"
 	"github.com/tgdrive/teldrive/pkg/services"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -141,6 +144,28 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 	if err := database.MigrateDB(db); err != nil {
 		lg.Error("failed to migrate database", zap.Error(err))
 		os.Exit(1)
+	}
+
+	if conf.Shared.IsShared {
+		if conf.Shared.GroupSecret == "" {
+			lg.Warn("shared mode disabled: groupSecret is missing")
+			conf.Shared.IsShared = false
+			conf.Shared.SharedError = "No secret in config file"
+		} else {
+			var hostMember models.GroupMember
+			err := db.Table("teldrive.group_members").Where("status = ?", "host").First(&hostMember).Error
+			if err == nil {
+				fingerprint := crypt.GetCryptoFingerprint(conf.TG.Uploads.EncryptionKey)
+				expectedHash := crypt.ComputeGroupHash(fingerprint, conf.Shared.GroupSecret)
+				if hostMember.StoredHash == nil || *hostMember.StoredHash != expectedHash {
+					lg.Warn("shared mode disabled: encryption key mismatch")
+					conf.Shared.IsShared = false
+					conf.Shared.SharedError = "Encryption key mismatch"
+				}
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				lg.Error("failed to query group_members during boot check", zap.Error(err))
+			}
+		}
 	}
 
 	// Wait for cache to be ready before setting up server
