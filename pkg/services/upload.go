@@ -195,7 +195,9 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	}
 
 	channelId := params.ChannelId.Value
-	if channelId == 0 {
+	if a.cnf.Shared.IsShared && intendedHostChannelId != 0 {
+		channelId = intendedHostChannelId
+	} else if channelId == 0 {
 		var err error
 		channelId, err = a.channelManager.CurrentChannel(ctx, userId)
 		if err != nil && err != tgc.ErrNoDefaultChannel {
