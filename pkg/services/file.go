@@ -460,6 +460,12 @@ func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error
 		return &apiError{err: errors.New("ids should not be empty"), code: 409}
 	}
 
+	for _, id := range req.Ids {
+		if utils.IsVirtualID(id) {
+			return &apiError{err: errors.New("cannot delete virtual folders"), code: 400}
+		}
+	}
+
 	var fileDB models.File
 
 	if err := a.db.Model(&models.File{}).Where("id = ?", req.Ids[0]).Where("user_id = ?", userId).
@@ -699,6 +705,15 @@ func (a *apiService) FilesMkdir(ctx context.Context, req *api.FileMkDir) error {
 func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 	userId := auth.GetUser(ctx)
 
+	for _, id := range req.Ids {
+		if utils.IsVirtualID(id) {
+			return &apiError{err: errors.New("cannot move virtual folders"), code: 400}
+		}
+	}
+	if utils.IsVirtualID(req.DestinationParent) {
+		return &apiError{err: errors.New("cannot move files directly into virtual folders"), code: 400}
+	}
+
 	var destParentID *string
 
 	if !isUUID(req.DestinationParent) {
@@ -817,6 +832,12 @@ func (a *apiService) FilesShareByid(ctx context.Context, params api.FilesShareBy
 }
 
 func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, params api.FilesUpdateParams) (*api.File, error) {
+	if utils.IsVirtualID(params.ID) {
+		return nil, &apiError{err: errors.New("cannot update virtual folders"), code: 400}
+	}
+	if req.ParentId.IsSet() && utils.IsVirtualID(req.ParentId.Value) {
+		return nil, &apiError{err: errors.New("cannot set parent to a virtual folder"), code: 400}
+	}
 
 	userId := auth.GetUser(ctx)
 
