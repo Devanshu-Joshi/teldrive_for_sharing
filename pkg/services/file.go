@@ -539,13 +539,29 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 			zap.Int64("user_id", userId),
 			zap.String("parent_id", params.ParentId.Value))
 
-		// [FUTURE INSERTION POINT: Phase 18B - Synthetic Root Construction]
-		// In Phase 18B, if the caller is an approved guest of one or more host sharing groups,
-		// we will fetch all active host groups they have access to, call BuildVirtualRoot(a.db, hostID)
-		// for each host, prepend those mock synthetic virtual root folders to the listing items list,
-		// and return the list immediately.
+		// Phase 18B: Synthetic Root Construction
+		if a.cnf.Shared.IsShared {
+			var member models.GroupMember
+			// Query the group_members table to check if the current user is an approved guest
+			if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&member).Error; err == nil {
+				// The guest is approved! Build the mock synthetic virtual root folder for their host.
+				virtualFolder, err := BuildVirtualRoot(a.db, member.HostID)
+				if err == nil {
+					// Return the synthetic overlay response immediately, completely bypassing normal physical root rendering
+					return &api.FileList{
+						Items: []api.File{virtualFolder},
+						Meta: api.Meta{
+							Count:       1,
+							TotalPages:  1,
+							CurrentPage: 1,
+						},
+					}, nil
+				}
+			}
+		}
 
-		// For Phase 18A, we branch safely and fall back to the standalone default root directory logic.
+		// Standalone fallback: If not in shared mode or not an approved guest,
+		// fall back to standard root rendering or empty listing.
 	}
 
 	// [FUTURE INSERTION POINT: Phase 18D - Virtual Subfolder Interception]
