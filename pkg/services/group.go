@@ -16,6 +16,7 @@ import (
 	"github.com/tgdrive/teldrive/internal/utils"
 	"github.com/tgdrive/teldrive/pkg/models"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // authenticateUser verifies user credentials and returns the context, user ID, and claims.
@@ -314,13 +315,13 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 
 	// Database transaction to prevent approval race conditions and enforce atomic updates
 	err := e.api.db.Transaction(func(tx *gorm.DB) error {
-		// 1. Verify caller is the active Host
-		var hostCount int64
-		if err := tx.Model(&models.GroupMember{}).Where("status = 'host' AND member_id = ?", userId).Count(&hostCount).Error; err != nil {
+		// 1. Verify caller is the active Host and lock Host's row to serialize all member management
+		var host models.GroupMember
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("status = 'host' AND member_id = ?", userId).First(&host).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("unauthorized: caller is not the active host")
+			}
 			return err
-		}
-		if hostCount == 0 {
-			return fmt.Errorf("unauthorized: caller is not the active host")
 		}
 
 		// 2. Fetch the target member record
