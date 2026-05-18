@@ -225,14 +225,18 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	}
 
 	if path != "" && fileIn.ParentId.Value == "" {
-		parentID, err = resolvePathID(a.db, path, userId)
+		parentID, err = resolvePathID(a.db, path, hostID)
 		if err != nil {
 			return nil, &apiError{err: err, code: 404}
 		}
 		fileDB.ParentId = parentID
 
 	} else if fileIn.ParentId.Value != "" {
-		fileDB.ParentId = utils.Ptr(fileIn.ParentId.Value)
+		if strings.HasPrefix(fileIn.ParentId.Value, "virtual_") {
+			fileDB.ParentId = nil
+		} else {
+			fileDB.ParentId = utils.Ptr(fileIn.ParentId.Value)
+		}
 	}
 
 	switch fileIn.Type {
@@ -306,7 +310,7 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	}
 	fileDB.Name = fileIn.Name
 	fileDB.Type = string(fileIn.Type)
-	fileDB.UserId = userId
+	fileDB.UserId = hostID
 	fileDB.Status = "active"
 	fileDB.Encrypted = utils.Ptr(fileIn.Encrypted.Value)
 	if fileIn.UpdatedAt.IsSet() && !fileIn.UpdatedAt.Value.IsZero() {
