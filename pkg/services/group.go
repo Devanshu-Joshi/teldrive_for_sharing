@@ -19,6 +19,19 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+type httpError struct {
+	Code int
+	Msg  string
+}
+
+func (e *httpError) Error() string {
+	return e.Msg
+}
+
+func newHttpError(code int, msg string) *httpError {
+	return &httpError{Code: code, Msg: msg}
+}
+
 // authenticateUser verifies user credentials and returns the context, user ID, and claims.
 func (e *extendedService) authenticateUser(w http.ResponseWriter, r *http.Request) (context.Context, int64, error) {
 	var token string
@@ -150,7 +163,7 @@ func (e *extendedService) ClaimHost(w http.ResponseWriter, r *http.Request, ctx 
 			return err
 		}
 		if count > 0 {
-			return fmt.Errorf("host already exists")
+			return newHttpError(http.StatusConflict, "host already exists")
 		}
 
 		doubleHash := crypt.ComputeGroupHash(req.Fingerprint, groupSecret)
@@ -167,7 +180,13 @@ func (e *extendedService) ClaimHost(w http.ResponseWriter, r *http.Request, ctx 
 	})
 
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		var hErr *httpError
+		if errors.As(err, &hErr) {
+			w.WriteHeader(hErr.Code)
+			w.Write([]byte(`{"error": "` + hErr.Msg + `"}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error": "` + err.Error() + `"}`))
 		return
 	}
@@ -210,14 +229,14 @@ func (e *extendedService) RequestAccess(w http.ResponseWriter, r *http.Request, 
 		var host models.GroupMember
 		if err := tx.Where("status = 'host'").First(&host).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("no active host found in the database")
+				return newHttpError(http.StatusNotFound, "no active host found in the database")
 			}
 			return err
 		}
 
 		// 2. Reject self-request (Host requesting access to themselves is redundant/invalid)
 		if host.MemberID == userId {
-			return fmt.Errorf("you are already the active host of this group")
+			return newHttpError(http.StatusConflict, "you are already the active host of this group")
 		}
 
 		// 3. Reject duplicate pending or approved requests
@@ -226,24 +245,24 @@ func (e *extendedService) RequestAccess(w http.ResponseWriter, r *http.Request, 
 			return err
 		}
 		if count > 0 {
-			return fmt.Errorf("request already pending or user is already a member")
+			return newHttpError(http.StatusConflict, "request already pending or user is already a member")
 		}
 
 		// 4. Verify basic Telegram Channel Access using the Guest's session
 		if host.ChannelID == nil {
-			return fmt.Errorf("host's Telegram channel is invalid/missing")
+			return newHttpError(http.StatusBadRequest, "host's Telegram channel is invalid/missing")
 		}
 		if !e.verifyChannelAccess(ctx, *host.ChannelID) {
-			return fmt.Errorf("you do not have access to the Host's required Telegram Channel")
+			return newHttpError(http.StatusForbidden, "you do not have access to the Host's required Telegram Channel")
 		}
 
 		// 5. Verify cryptographic compatibility safely
 		if host.StoredHash == nil {
-			return fmt.Errorf("host has no cryptographic fingerprint stored")
+			return newHttpError(http.StatusBadRequest, "host has no cryptographic fingerprint stored")
 		}
 		calculatedDoubleHash := crypt.ComputeGroupHash(req.Fingerprint, e.api.cnf.Shared.GroupSecret)
 		if *host.StoredHash != calculatedDoubleHash {
-			return fmt.Errorf("encryption key or group secret mismatch")
+			return newHttpError(http.StatusForbidden, "encryption key or group secret mismatch")
 		}
 
 		// 6. Create the pending request record
@@ -256,7 +275,13 @@ func (e *extendedService) RequestAccess(w http.ResponseWriter, r *http.Request, 
 	})
 
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		var hErr *httpError
+		if errors.As(err, &hErr) {
+			w.WriteHeader(hErr.Code)
+			w.Write([]byte(`{"error": "` + hErr.Msg + `"}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error": "` + err.Error() + `"}`))
 		return
 	}
@@ -319,7 +344,7 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 		var host models.GroupMember
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("status = 'host' AND member_id = ?", userId).First(&host).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("unauthorized: caller is not the active host")
+				return newHttpError(http.StatusForbidden, "unauthorized: caller is not the active host")
 			}
 			return err
 		}
@@ -328,13 +353,13 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 		var member models.GroupMember
 		if err := tx.Where("member_id = ?", req.MemberID).First(&member).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("pending request not found")
+				return newHttpError(http.StatusNotFound, "pending request not found")
 			}
 			return err
 		}
 
 		if member.Status != "pending" {
-			return fmt.Errorf("member is already in '%s' status", member.Status)
+			return newHttpError(http.StatusConflict, fmt.Sprintf("member is already in '%s' status", member.Status))
 		}
 
 		if req.Action == "approve" {
@@ -344,7 +369,7 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 				return err
 			}
 			if activeCount >= 50 {
-				return fmt.Errorf("group capacity reached (max 50 members)")
+				return newHttpError(http.StatusConflict, "group capacity reached (max 50 members)")
 			}
 
 			// Perform approval
@@ -362,7 +387,13 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 	})
 
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		var hErr *httpError
+		if errors.As(err, &hErr) {
+			w.WriteHeader(hErr.Code)
+			w.Write([]byte(`{"error": "` + hErr.Msg + `"}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error": "` + err.Error() + `"}`))
 		return
 	}
@@ -382,7 +413,7 @@ func (e *extendedService) LeaveGroup(w http.ResponseWriter, r *http.Request, ctx
 		var callerMember models.GroupMember
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("member_id = ?", userId).First(&callerMember).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("you are not a member of any group")
+				return newHttpError(http.StatusNotFound, "you are not a member of any group")
 			}
 			return err
 		}
@@ -408,7 +439,13 @@ func (e *extendedService) LeaveGroup(w http.ResponseWriter, r *http.Request, ctx
 	})
 
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		var hErr *httpError
+		if errors.As(err, &hErr) {
+			w.WriteHeader(hErr.Code)
+			w.Write([]byte(`{"error": "` + hErr.Msg + `"}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`{"error": "` + err.Error() + `"}`))
 		return
 	}
