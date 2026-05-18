@@ -21,7 +21,18 @@ func ParseVirtualID(id string) (int64, error) {
 		return 0, strconv.ErrSyntax
 	}
 	userIdStr := strings.TrimPrefix(id, "virtual_")
-	return strconv.ParseInt(userIdStr, 10, 64)
+	val, err := strconv.ParseInt(userIdStr, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if val <= 0 {
+		return 0, strconv.ErrSyntax
+	}
+	// Check for strict canonical representation to reject "+1", "01", " 1", etc.
+	if strconv.FormatInt(val, 10) != userIdStr {
+		return 0, strconv.ErrSyntax
+	}
+	return val, nil
 }
 
 // GenerateRandomSecret generates a cryptographically secure random secret.

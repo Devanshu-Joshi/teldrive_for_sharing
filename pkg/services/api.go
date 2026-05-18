@@ -232,6 +232,9 @@ func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		m.next.ServeHTTP(rec, r)
 		for k, v := range rec.Header() {
+			if k == "Content-Length" {
+				continue
+			}
 			for _, val := range v {
 				w.Header().Add(k, val)
 			}

@@ -68,6 +68,10 @@ func GetUserGroup(c context.Context, db *gorm.DB, isShared bool) ([]int64, int64
 		return []int64{userId}, 0 // Pending or un-affiliated
 	}
 
+	if status != "approved" && status != "host" {
+		return []int64{userId}, 0 // strictly exclude pending or stale users
+	}
+
 	var channelId int64
 	db.Model(&models.GroupMember{}).Select("channel_id").Where("member_id = ? AND status = 'host'", hostId).Row().Scan(&channelId)
 
@@ -88,6 +92,11 @@ func GetUserGroup(c context.Context, db *gorm.DB, isShared bool) ([]int64, int64
 		return finalIds[:50], channelId
 	}
 	return finalIds, channelId
+}
+
+// WithUser returns a new context with the authenticated user claims injected.
+func WithUser(ctx context.Context, claims *types.JWTClaims) context.Context {
+	return context.WithValue(ctx, authKey, claims)
 }
 
 func GetJWTUser(c context.Context) *types.JWTClaims {
