@@ -727,11 +727,26 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 		destParentID = &req.DestinationParent
 	}
 
-	var srcFile models.File
-	if err := a.db.Model(&models.File{}).Where("id = ?", req.Ids[0]).First(&srcFile).Error; err != nil {
+	if len(req.Ids) == 0 {
+		return &apiError{err: errors.New("ids should not be empty"), code: 400}
+	}
+
+	var srcFiles []models.File
+	if err := a.db.Model(&models.File{}).Where("id IN ?", req.Ids).Find(&srcFiles).Error; err != nil {
 		return &apiError{err: err}
 	}
-	srcOwner := srcFile.UserId
+
+	if len(srcFiles) != len(req.Ids) {
+		return &apiError{err: errors.New("cannot move files across different partition owners or files not found"), code: 403}
+	}
+
+	srcOwner := srcFiles[0].UserId
+	for _, f := range srcFiles {
+		if f.UserId != srcOwner {
+			return &apiError{err: errors.New("cannot move files across different partition owners"), code: 403}
+		}
+	}
+
 
 	var destOwner int64
 	if destParentID == nil || *destParentID == "" || *destParentID == "00000000-0000-0000-0000-000000000000" {
