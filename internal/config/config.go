@@ -51,6 +51,7 @@ type EventConfig struct {
 type SharedConfig struct {
 	IsShared    bool   `default:"false" description:"Enable shared group union view mode"`
 	GroupSecret string `default:"" description:"Out-of-band group secret for cryptographic verification"`
+	SharedError string `skipPflag:"true"`
 }
 
 type ServerCmdConfig struct {

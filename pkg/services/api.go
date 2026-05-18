@@ -1,7 +1,9 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -222,6 +224,32 @@ func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case api.EventsEventsStreamOperation:
 		m.srv.EventsEventsStream(w, r)
 		return
+	case api.AuthSessionOperation:
+		rec := &responseRecorder{
+			ResponseWriter: w,
+			body:           &bytes.Buffer{},
+			statusCode:     http.StatusOK,
+		}
+		m.next.ServeHTTP(rec, r)
+		for k, v := range rec.Header() {
+			for _, val := range v {
+				w.Header().Add(k, val)
+			}
+		}
+		w.WriteHeader(rec.statusCode)
+		
+		if rec.statusCode == http.StatusOK && rec.body.Len() > 0 {
+			var data map[string]any
+			if err := json.Unmarshal(rec.body.Bytes(), &data); err == nil {
+				data["sharedMode"] = m.srv.api.cnf.Shared.IsShared
+				data["sharedError"] = m.srv.api.cnf.Shared.SharedError
+				newBody, _ := json.Marshal(data)
+				w.Write(newBody)
+				return
+			}
+		}
+		w.Write(rec.body.Bytes())
+		return
 	}
 	m.next.ServeHTTP(w, r)
 }
@@ -241,6 +269,20 @@ func (a apiError) Error() string {
 
 func (a *apiError) Unwrap() error {
 	return a.err
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	body       *bytes.Buffer
+	statusCode int
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	return r.body.Write(b)
+}
+
+func (r *responseRecorder) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
 }
 
 var (
