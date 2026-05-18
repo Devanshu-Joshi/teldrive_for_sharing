@@ -1,11 +1,35 @@
 package utils
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
+
+// IsVirtualID checks if an ID represents a virtual folder.
+func IsVirtualID(id string) bool {
+	return strings.HasPrefix(id, "virtual_")
+}
+
+// ParseVirtualID extracts the user ID from a virtual folder ID string.
+func ParseVirtualID(id string) (int64, error) {
+	if !IsVirtualID(id) {
+		return 0, strconv.ErrSyntax
+	}
+	userIdStr := strings.TrimPrefix(id, "virtual_")
+	return strconv.ParseInt(userIdStr, 10, 64)
+}
+
+// GenerateRandomSecret generates a cryptographically secure random secret.
+func GenerateRandomSecret(length int) string {
+	bytes := make([]byte, length/2)
+	_, _ = rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
 
 func CamelToSnake(input string) string {
 	re := regexp.MustCompile("([a-z0-9])([A-Z])")
