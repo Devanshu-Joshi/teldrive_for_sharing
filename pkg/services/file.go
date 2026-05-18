@@ -580,25 +580,31 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 
 	// Phase 18C: Validate and parse virtual ID if request parent folder ID starts with virtual_
 	if strings.HasPrefix(params.ParentId.Value, "virtual_") {
-		_, err := utils.ParseVirtualID(params.ParentId.Value)
+		hostID, err := utils.ParseVirtualID(params.ParentId.Value)
 		if err != nil {
 			return nil, &apiError{err: errors.New("invalid virtual id format"), code: 400}
 		}
 
-		// [FUTURE INSERTION POINT: Phase 18D - Virtual Subfolder Interception]
-		// In Phase 18D, if a directory query is made for a parent folder ID that matches a synthetic
-		// virtual folder 'virtual_<host_id>', we will intercept the file query, bypass this standard
-		// queryBuilder.execute block, and query folders/files belonging to the host_id instead of the userId.
-		//
-		// For Phase 18C, this is validation-only, so we bypass execution by returning an empty FileList.
-		return &api.FileList{
-			Items: []api.File{},
-			Meta: api.Meta{
-				Count:       0,
-				TotalPages:  1,
-				CurrentPage: 1,
-			},
-		}, nil
+		// Phase 18D: Virtual Subfolder Interception
+		// Ensure the host exists
+		var hostUser models.User
+		if err := a.db.Where("user_id = ?", hostID).First(&hostUser).Error; err != nil {
+			return nil, &apiError{err: errors.New("host user not found"), code: 404}
+		}
+
+		// Ensure caller is authorized (either the host or an approved guest)
+		if userId != hostID {
+			var member models.GroupMember
+			if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, hostID).First(&member).Error; err != nil {
+				return nil, &apiError{err: errors.New("unauthorized guest access"), code: 403}
+			}
+		}
+
+		// Rewrite the query scope by unsetting ParentId to query the host's physical root
+		params.ParentId.SetTo("")
+
+		queryBuilder := &fileQueryBuilder{db: a.db}
+		return queryBuilder.execute(&params, hostID)
 	}
 
 	queryBuilder := &fileQueryBuilder{db: a.db}
