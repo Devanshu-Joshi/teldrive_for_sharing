@@ -195,6 +195,16 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.File, error) {
 	userId := auth.GetUser(ctx)
 
+	// Phase 20: Validate and classify upload target beforehand (Readiness Layer Only)
+	hostID, isVirtual, classifyErr := a.ClassifyUploadTarget(ctx, fileIn.ParentId.Value, fileIn.Path.Value, userId)
+	if classifyErr != nil {
+		return nil, classifyErr
+	}
+	logging.FromContext(ctx).Info("Phase 20 Upload Classification Readiness",
+		zap.Int64("caller_id", userId),
+		zap.Int64("target_host_id", hostID),
+		zap.Bool("is_virtual", isVirtual))
+
 	var (
 		fileDB    models.File
 		parentID  *string
@@ -1158,4 +1168,70 @@ func mapParts(_parts []api.Part) []api.Part {
 		return p
 	})
 
+}
+
+// ClassifyUploadTarget determines whether an upload target (parentId or path) belongs to
+// standalone user space or a virtual host space, and enforces strict authorization boundaries.
+// It returns (hostID, isVirtual, error).
+func (a *apiService) ClassifyUploadTarget(ctx context.Context, parentId string, path string, userId int64) (int64, bool, error) {
+	// 1. Check for synthetic virtual root upload target
+	if parentId != "" && strings.HasPrefix(parentId, "virtual_") {
+		hostID, err := utils.ParseVirtualID(parentId)
+		if err != nil {
+			return 0, false, &apiError{err: errors.New("invalid virtual id format"), code: 400}
+		}
+
+		// Ensure active host exists
+		var hostUser models.User
+		if err := a.db.Where("user_id = ?", hostID).First(&hostUser).Error; err != nil {
+			return 0, false, &apiError{err: errors.New("host user not found"), code: 404}
+		}
+
+		// Enforce dynamic authorization: guest must be approved by the host
+		if userId != hostID {
+			var member models.GroupMember
+			if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, hostID).First(&member).Error; err != nil {
+				return 0, false, &apiError{err: errors.New("unauthorized guest upload access"), code: 403}
+			}
+		}
+
+		return hostID, true, nil
+	}
+
+	// 2. Check for physical nested folder target using UUID
+	if parentId != "" && isUUID(parentId) {
+		var parentFolder models.File
+		if err := a.db.Where("id = ? AND type = 'folder'", parentId).First(&parentFolder).Error; err == nil {
+			if parentFolder.UserId != userId {
+				// Enforce dynamic authorization: guest must be approved by the folder owner (host)
+				var member models.GroupMember
+				if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, parentFolder.UserId).First(&member).Error; err != nil {
+					return 0, false, &apiError{err: errors.New("unauthorized guest upload access"), code: 403}
+				}
+				return parentFolder.UserId, true, nil
+			}
+		}
+	}
+
+	// 3. Check for path-based resolution target
+	if path != "" && parentId == "" {
+		// Resolve path under current caller's context first
+		resolvedID, err := resolvePathID(a.db, path, userId)
+		if err == nil && resolvedID != nil {
+			// If resolved, verify its owner in case it's not the caller (not normally possible for path resolution under userId)
+			var folder models.File
+			if err := a.db.Where("id = ? AND type = 'folder'", *resolvedID).First(&folder).Error; err == nil {
+				if folder.UserId != userId {
+					var member models.GroupMember
+					if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, folder.UserId).First(&member).Error; err != nil {
+						return 0, false, &apiError{err: errors.New("unauthorized guest upload access"), code: 403}
+					}
+					return folder.UserId, true, nil
+				}
+			}
+		}
+	}
+
+	// Default to standalone upload target (belongs to caller themselves)
+	return userId, false, nil
 }
