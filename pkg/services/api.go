@@ -203,6 +203,10 @@ type extendedMiddleware struct {
 }
 
 func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/group/") {
+		m.srv.HandleGroupRoute(w, r)
+		return
+	}
 	route, ok := m.next.FindRoute(r.Method, r.URL.Path)
 	if !ok {
 		m.next.ServeHTTP(w, r)
