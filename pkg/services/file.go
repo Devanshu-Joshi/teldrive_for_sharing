@@ -509,8 +509,8 @@ func (a *apiService) FilesEditShare(ctx context.Context, req *api.FileShareCreat
 func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdParams) (*api.File, error) {
 	// Phase 18C: Validate and parse virtual ID if request ID starts with virtual_
 	if strings.HasPrefix(params.ID, "virtual_") {
-		hostID, ok := ParseVirtualID(params.ID)
-		if !ok {
+		hostID, err := utils.ParseVirtualID(params.ID)
+		if err != nil {
 			return nil, &apiError{err: errors.New("invalid virtual id format"), code: 400}
 		}
 		// Build and return the mock synthetic virtual folder details safely
@@ -580,8 +580,8 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 
 	// Phase 18C: Validate and parse virtual ID if request parent folder ID starts with virtual_
 	if strings.HasPrefix(params.ParentId.Value, "virtual_") {
-		_, ok := ParseVirtualID(params.ParentId.Value)
-		if !ok {
+		_, err := utils.ParseVirtualID(params.ParentId.Value)
+		if err != nil {
 			return nil, &apiError{err: errors.New("invalid virtual id format"), code: 400}
 		}
 

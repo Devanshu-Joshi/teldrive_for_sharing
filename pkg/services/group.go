@@ -479,34 +479,3 @@ func BuildVirtualRoot(db *gorm.DB, hostID int64) (api.File, error) {
 
 	return virtualFile, nil
 }
-
-// ParseVirtualID safely parses and validates a virtual_<host_id> folder identifier.
-// It strictly rejects leading zeros, spaces, signs, out-of-range integers, and malformed strings.
-func ParseVirtualID(id string) (int64, bool) {
-	if !strings.HasPrefix(id, "virtual_") {
-		return 0, false
-	}
-	numStr := strings.TrimPrefix(id, "virtual_")
-	if numStr == "" {
-		return 0, false
-	}
-	// Strictly validate characters: only digits '0'-'9' are allowed. No signs ('-', '+'), no spaces, no dots.
-	for i := 0; i < len(numStr); i++ {
-		if numStr[i] < '0' || numStr[i] > '9' {
-			return 0, false
-		}
-	}
-	// Prevent leading zeros (e.g. "01")
-	if numStr[0] == '0' {
-		return 0, false
-	}
-	// Parse as int64
-	hostID, err := strconv.ParseInt(numStr, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	if hostID <= 0 {
-		return 0, false
-	}
-	return hostID, true
-}
