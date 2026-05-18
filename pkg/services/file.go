@@ -735,7 +735,8 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 
 	var destOwner int64
 	if destParentID == nil || *destParentID == "" || *destParentID == "00000000-0000-0000-0000-000000000000" {
-		destOwner = userId
+		destOwner = srcOwner
+		destParentID = nil
 	} else {
 		var destFile models.File
 		if err := a.db.Model(&models.File{}).Where("id = ?", *destParentID).First(&destFile).Error; err != nil {
