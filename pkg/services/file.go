@@ -529,6 +529,16 @@ func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdPa
 		return nil, &apiError{err: err}
 	}
 
+	// Phase 19: Strict Ownership & Read Boundary Validation for single file access
+	userId := auth.GetUser(ctx)
+	if file.UserId != userId {
+		// Dynamically verify that the guest is an approved member of that host.
+		var member models.GroupMember
+		if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, file.UserId).First(&member).Error; err != nil {
+			return nil, &apiError{err: errors.New("unauthorized guest access"), code: 403}
+		}
+	}
+
 	path, err := a.getFullPath(a.db, params.ID)
 	if err != nil {
 		return nil, &apiError{err: err}
@@ -538,6 +548,11 @@ func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdPa
 	res.Path = api.NewOptString(path)
 	if file.ChannelId != nil {
 		res.ChannelId = api.NewOptInt64(*file.ChannelId)
+	}
+
+	// Phase 19: Rewrite parent ID of host's physical root files to virtual_<host_id>
+	if file.UserId != userId && (file.ParentId == nil || *file.ParentId == "") {
+		res.ParentId = api.NewOptString("virtual_" + strconv.FormatInt(file.UserId, 10))
 	}
 
 	return res, nil
@@ -604,7 +619,39 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 		params.ParentId.SetTo("nil")
 
 		queryBuilder := &fileQueryBuilder{db: a.db}
-		return queryBuilder.execute(&params, hostID)
+		res, err := queryBuilder.execute(&params, hostID)
+		if err != nil {
+			return nil, err
+		}
+
+		// Phase 19: Rewrite parent ID of host's physical root files to virtual_<host_id>
+		// so that the client frontend places them securely under the virtual folder node.
+		for i := range res.Items {
+			if !res.Items[i].ParentId.IsSet() || res.Items[i].ParentId.Value == "" {
+				res.Items[i].ParentId = api.NewOptString("virtual_" + strconv.FormatInt(hostID, 10))
+			}
+		}
+		return res, nil
+	}
+
+	// Phase 19: Physical Subfolder Authorization & Redirection
+	// If a guest requests folders or files inside a physical folder ID (which belongs to a host),
+	// we must dynamically verify they have access and delegate GORM query builder context to the host.
+	if params.ParentId.Value != "" && isUUID(params.ParentId.Value) {
+		var parentFolder models.File
+		if err := a.db.Where("id = ? AND type = 'folder'", params.ParentId.Value).First(&parentFolder).Error; err == nil {
+			if parentFolder.UserId != userId {
+				// Dynamically verify that the guest is an approved member of that host.
+				var member models.GroupMember
+				if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, parentFolder.UserId).First(&member).Error; err != nil {
+					return nil, &apiError{err: errors.New("unauthorized guest access"), code: 403}
+				}
+
+				// Delegate directory query execution to GORM query builder under the host's context.
+				queryBuilder := &fileQueryBuilder{db: a.db}
+				return queryBuilder.execute(&params, parentFolder.UserId)
+			}
+		}
 	}
 
 	queryBuilder := &fileQueryBuilder{db: a.db}
