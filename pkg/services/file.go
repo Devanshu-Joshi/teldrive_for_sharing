@@ -395,6 +395,19 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 func (a *apiService) FilesCreateShare(ctx context.Context, req *api.FileShareCreate, params api.FilesCreateShareParams) error {
 	userId := auth.GetUser(ctx)
 
+	if utils.IsVirtualID(params.ID) {
+		return &apiError{err: errors.New("cannot share virtual folders"), code: 400}
+	}
+
+	var fileDB models.File
+	if err := a.db.Model(&models.File{}).Where("id = ?", params.ID).First(&fileDB).Error; err != nil {
+		return &apiError{err: err}
+	}
+
+	if fileDB.UserId != userId {
+		return &apiError{err: errors.New("cannot share content owned by a different user"), code: 403}
+	}
+
 	var fileShare models.FileShare
 
 	if req.Password.Value != "" {
