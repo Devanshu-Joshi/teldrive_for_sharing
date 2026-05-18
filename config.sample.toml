@@ -82,3 +82,7 @@ encryption-key = ''
 max-retries = 10
 retention = '7d'
 threads = 8
+
+[shared]
+is-shared = false
+group-secret = ''

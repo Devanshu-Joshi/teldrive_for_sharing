@@ -48,6 +48,11 @@ type EventConfig struct {
 	DeduplicationTTL time.Duration `default:"5s" description:"Event deduplication time-to-live"`
 }
 
+type SharedConfig struct {
+	IsShared    bool   `default:"false" description:"Enable shared group union view mode"`
+	GroupSecret string `default:"" description:"Out-of-band group secret for cryptographic verification"`
+}
+
 type ServerCmdConfig struct {
 	Server   ServerConfig
 	Log      LoggingConfig
@@ -58,6 +63,7 @@ type ServerCmdConfig struct {
 	Cache    CacheConfig
 	Redis    RedisConfig
 	Events   EventConfig
+	Shared   SharedConfig `skipPflag:"true"`
 }
 
 type CheckCmdConfig struct {
