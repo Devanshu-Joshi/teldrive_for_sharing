@@ -764,6 +764,37 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 		return &apiError{err: errors.New("cannot move files across different partition owners"), code: 403}
 	}
 
+	if destParentID != nil {
+		var descendantIDs []string
+		query := `
+		WITH RECURSIVE descendants AS (
+			SELECT id, parent_id
+			FROM teldrive.files
+			WHERE id = ANY(?) AND status = 'active'
+			UNION ALL
+			SELECT f.id, f.parent_id
+			FROM teldrive.files f
+			INNER JOIN descendants d ON f.parent_id = d.id
+			WHERE f.status = 'active'
+		)
+		SELECT id FROM descendants;
+		`
+		items := pgtype.Array[string]{
+			Elements: req.Ids,
+			Valid:    true,
+			Dims:     []pgtype.ArrayDimension{{Length: int32(len(req.Ids)), LowerBound: 1}},
+		}
+		if err := a.db.Raw(query, items).Scan(&descendantIDs).Error; err != nil {
+			return &apiError{err: err}
+		}
+
+		for _, descID := range descendantIDs {
+			if descID == *destParentID {
+				return &apiError{err: errors.New("cannot move folder into itself or its descendants"), code: 409}
+			}
+		}
+	}
+
 	err := a.db.Transaction(func(tx *gorm.DB) error {
 		var srcFile models.File
 		if err := tx.Where("id = ? AND user_id = ?", req.Ids[0], userId).First(&srcFile).Error; err != nil {
