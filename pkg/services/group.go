@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/tgdrive/teldrive/internal/api"
 	"github.com/tgdrive/teldrive/internal/auth"
 	"github.com/tgdrive/teldrive/internal/crypt"
 	"github.com/tgdrive/teldrive/internal/tgc"
@@ -451,4 +453,29 @@ func (e *extendedService) LeaveGroup(w http.ResponseWriter, r *http.Request, ctx
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status": "Success", "message": "Successfully left the group or dismantled it"}`))
+}
+
+// BuildVirtualRoot builds a mock synthetic folder structure for a given host user.
+// It is a purely additive helper with no persistence or side effects.
+func BuildVirtualRoot(db *gorm.DB, hostID int64) (api.File, error) {
+	name := fmt.Sprintf("Shared Space (%d)", hostID)
+	var hostUser models.User
+	if err := db.Where("user_id = ?", hostID).First(&hostUser).Error; err == nil {
+		if hostUser.UserName != "" {
+			name = "@" + hostUser.UserName
+		} else if hostUser.Name != "" {
+			name = hostUser.Name
+		}
+	}
+
+	virtualFile := api.File{
+		ID:        api.NewOptString(fmt.Sprintf("virtual_%d", hostID)),
+		Name:      name,
+		Type:      api.FileTypeFolder,
+		Size:      api.NewOptInt64(0),
+		ParentId:  api.NewOptString("root"),
+		UpdatedAt: api.NewOptDateTime(time.Now().UTC()),
+	}
+
+	return virtualFile, nil
 }

@@ -532,6 +532,27 @@ func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdPa
 func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) (*api.FileList, error) {
 	userId := auth.GetUser(ctx)
 
+	// Phase 18A: Detect synthetic root request
+	if params.ParentId.Value == "root" {
+		// Detection triggered! Branch safely.
+		logging.FromContext(ctx).Info("Phase 18A: Synthetic root request detected",
+			zap.Int64("user_id", userId),
+			zap.String("parent_id", params.ParentId.Value))
+
+		// [FUTURE INSERTION POINT: Phase 18B - Synthetic Root Construction]
+		// In Phase 18B, if the caller is an approved guest of one or more host sharing groups,
+		// we will fetch all active host groups they have access to, call BuildVirtualRoot(a.db, hostID)
+		// for each host, prepend those mock synthetic virtual root folders to the listing items list,
+		// and return the list immediately.
+
+		// For Phase 18A, we branch safely and fall back to the standalone default root directory logic.
+	}
+
+	// [FUTURE INSERTION POINT: Phase 18D - Virtual Subfolder Interception]
+	// In Phase 18D, if a directory query is made for a parent folder ID that matches a synthetic
+	// virtual folder 'virtual_<host_id>', we will intercept the file query, bypass this standard
+	// queryBuilder.execute block, and query folders/files belonging to the host_id instead of the userId.
+
 	queryBuilder := &fileQueryBuilder{db: a.db}
 
 	return queryBuilder.execute(&params, userId)
