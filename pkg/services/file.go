@@ -507,6 +507,20 @@ func (a *apiService) FilesEditShare(ctx context.Context, req *api.FileShareCreat
 }
 
 func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdParams) (*api.File, error) {
+	// Phase 18C: Validate and parse virtual ID if request ID starts with virtual_
+	if strings.HasPrefix(params.ID, "virtual_") {
+		hostID, ok := ParseVirtualID(params.ID)
+		if !ok {
+			return nil, &apiError{err: errors.New("invalid virtual id format"), code: 400}
+		}
+		// Build and return the mock synthetic virtual folder details safely
+		virtualFolder, err := BuildVirtualRoot(a.db, hostID)
+		if err != nil {
+			return nil, &apiError{err: err}
+		}
+		return &virtualFolder, nil
+	}
+
 	var file models.File
 	if err := a.db.Model(&models.File{}).Where("id = ?", params.ID).First(&file).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -564,10 +578,28 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 		// fall back to standard root rendering or empty listing.
 	}
 
-	// [FUTURE INSERTION POINT: Phase 18D - Virtual Subfolder Interception]
-	// In Phase 18D, if a directory query is made for a parent folder ID that matches a synthetic
-	// virtual folder 'virtual_<host_id>', we will intercept the file query, bypass this standard
-	// queryBuilder.execute block, and query folders/files belonging to the host_id instead of the userId.
+	// Phase 18C: Validate and parse virtual ID if request parent folder ID starts with virtual_
+	if strings.HasPrefix(params.ParentId.Value, "virtual_") {
+		_, ok := ParseVirtualID(params.ParentId.Value)
+		if !ok {
+			return nil, &apiError{err: errors.New("invalid virtual id format"), code: 400}
+		}
+
+		// [FUTURE INSERTION POINT: Phase 18D - Virtual Subfolder Interception]
+		// In Phase 18D, if a directory query is made for a parent folder ID that matches a synthetic
+		// virtual folder 'virtual_<host_id>', we will intercept the file query, bypass this standard
+		// queryBuilder.execute block, and query folders/files belonging to the host_id instead of the userId.
+		//
+		// For Phase 18C, this is validation-only, so we bypass execution by returning an empty FileList.
+		return &api.FileList{
+			Items: []api.File{},
+			Meta: api.Meta{
+				Count:       0,
+				TotalPages:  1,
+				CurrentPage: 1,
+			},
+		}, nil
+	}
 
 	queryBuilder := &fileQueryBuilder{db: a.db}
 
