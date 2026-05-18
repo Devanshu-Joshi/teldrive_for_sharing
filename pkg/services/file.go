@@ -252,6 +252,20 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 		} else {
 			channelId = fileIn.ChannelId.Value
 		}
+
+		// Phase 21B: Explicitly overwrite ChannelID with Host channel ID if upload is virtualized
+		if isVirtual {
+			var hostChannelId int64
+			err := a.db.Model(&models.GroupMember{}).
+				Select("channel_id").
+				Where("member_id = ? AND status = 'host'", hostID).
+				Row().
+				Scan(&hostChannelId)
+			if err == nil && hostChannelId != 0 {
+				channelId = hostChannelId
+			}
+		}
+
 		fileDB.ChannelId = &channelId
 		fileDB.MimeType = fileIn.MimeType.Value
 		fileDB.Category = utils.Ptr(string(category.GetCategory(fileIn.Name)))
