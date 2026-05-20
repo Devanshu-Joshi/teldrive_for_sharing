@@ -107,6 +107,33 @@ func AuthClient(ctx context.Context, config *config.TGConfig, sessionStr string,
 }
 
 // BotClient creates a Telegram client for bot authentication.
+func isPermanentAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	if tgerr.Is(err, "AUTH_KEY_UNREGISTERED", "USER_DEACTIVATED", "SESSION_REVOKED", "TOKEN_INVALID", "BOT_INVALID") {
+		return true
+	}
+	lowerErr := strings.ToLower(errStr)
+	permanentPatterns := []string{
+		"401",
+		"token_invalid",
+		"bot_invalid",
+		"auth_key_unregistered",
+		"user_deactivated",
+		"session_revoked",
+		"unregistered",
+	}
+	for _, pattern := range permanentPatterns {
+		if strings.Contains(lowerErr, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// BotClient creates a Telegram client for bot authentication.
 // Uses database-backed session storage for persistent bot sessions.
 // Note: storage remains open for client's lifetime - do not close it here
 func BotClient(ctx context.Context, db *gorm.DB, cache cache.Cacher, config *config.TGConfig, token string, middlewares ...telegram.Middleware) (*telegram.Client, error) {
@@ -121,6 +148,12 @@ func BotClient(ctx context.Context, db *gorm.DB, cache cache.Cacher, config *con
 		return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 			err := next.Invoke(ctx, input, output)
 			if err != nil {
+				// Detect permanent auth/token failures (Phase 30)
+				if isPermanentAuthError(err) {
+					GetGlobalTokenState().MarkRevoked(token)
+					return errors.New("bot token permanently revoked: " + err.Error())
+				}
+
 				if tgerr.Is(err, "FLOOD_WAIT", "FLOOD_WAIT_X") || strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "cooldown") {
 					GetGlobalTokenState().SetCooldown(token, time.Now().Add(60*time.Second))
 					// Wrap error to ensure it fails fast and bypasses gotd's built-in floodwait sleeping
