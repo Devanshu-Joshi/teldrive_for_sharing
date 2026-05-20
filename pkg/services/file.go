@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -192,6 +193,34 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 	return mapper.ToFileOut(dbFile), nil
 }
 
+func validateUploadParts(uploads []models.Upload) error {
+	n := len(uploads)
+	if n == 0 {
+		return errors.New("empty upload set")
+	}
+
+	// Rule 1: Explicitly sort uploads using sort.Slice in ascending order of PartNo
+	sort.Slice(uploads, func(i, j int) bool {
+		return uploads[i].PartNo < uploads[j].PartNo
+	})
+
+	// Rules 2, 3: Verify no duplicates, no gaps, and sequence starts at exactly 1
+	for i, upload := range uploads {
+		expectedPartNo := i + 1
+		if upload.PartNo < 1 {
+			return fmt.Errorf("invalid part number: %d (must be >= 1)", upload.PartNo)
+		}
+		if upload.PartNo != expectedPartNo {
+			if upload.PartNo < expectedPartNo {
+				return fmt.Errorf("duplicate chunk detected for part_no: %d", upload.PartNo)
+			}
+			return fmt.Errorf("missing chunk gap detected: expected part_no %d, got %d", expectedPartNo, upload.PartNo)
+		}
+	}
+
+	return nil
+}
+
 func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.File, error) {
 	userId := auth.GetUser(ctx)
 
@@ -279,6 +308,11 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 			// Fetch parts from uploads table
 			if err := a.db.Where("upload_id = ?", uploadId).Order("part_no").Find(&uploads).Error; err != nil {
 				return nil, &apiError{err: err}
+			}
+
+			// Enforce completeness & continuity validation (PROTECTION 2)
+			if err := validateUploadParts(uploads); err != nil {
+				return nil, &apiError{err: err, code: 409}
 			}
 
 			// Validate parts: sum of sizes must equal file size and no partId should be 0
@@ -932,6 +966,12 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		if err := a.db.Where("upload_id = ?", uploadId).Order("part_no").Find(&uploads).Error; err != nil {
 			return nil, &apiError{err: err}
 		}
+
+		// Enforce completeness & continuity validation (PROTECTION 2)
+		if err := validateUploadParts(uploads); err != nil {
+			return nil, &apiError{err: err, code: 409}
+		}
+
 		var totalSize int64
 		for _, u := range uploads {
 			req.Parts = append(req.Parts, api.Part{
