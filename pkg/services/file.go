@@ -1188,14 +1188,14 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 		var descendantIDs []string
 		query := `
 		WITH RECURSIVE descendants(id, parent_id, path) AS (
-			SELECT id, parent_id, ARRAY[id]::text[]
+			SELECT id, parent_id, ARRAY[id::text]
 			FROM teldrive.files
 			WHERE id = ANY(?) AND status = 'active'
 			UNION ALL
 			SELECT f.id, f.parent_id, d.path || f.id::text
 			FROM teldrive.files f
 			INNER JOIN descendants d ON f.parent_id = d.id
-			WHERE f.status = 'active' AND NOT (f.id = ANY(d.path))
+			WHERE f.status = 'active' AND NOT (f.id::text = ANY(d.path))
 		)
 		SELECT id FROM descendants;
 		`
