@@ -186,16 +186,16 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	// This is ORIGINAL roadmap EPIC 5 — Phase 21A
 	// Read-only Upload Channel Resolution
 	var intendedHostChannelId int64
-	if a.cnf.Shared.IsShared {
-		_, hostChannelId := auth.GetUserGroup(ctx, a.db, true)
-		intendedHostChannelId = hostChannelId
+	cap := a.ValidateSharedCapability(ctx, userId)
+	if cap.Valid && cap.ChannelID != nil {
+		intendedHostChannelId = *cap.ChannelID
 		logger.Info("Phase 21A Upload Intended Routing Resolution",
 			zap.Int64("caller_id", userId),
 			zap.Int64("intended_host_channel_id", intendedHostChannelId))
 	}
 
 	channelId := params.ChannelId.Value
-	if a.cnf.Shared.IsShared && intendedHostChannelId != 0 {
+	if cap.Valid && intendedHostChannelId != 0 {
 		channelId = intendedHostChannelId
 	} else if channelId == 0 {
 		var err error

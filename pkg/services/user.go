@@ -85,6 +85,12 @@ func (a *apiService) UsersListChannels(ctx context.Context) ([]api.Channel, erro
 
 func (a *apiService) UsersCreateChannel(ctx context.Context, req *api.Channel) error {
 	userID := auth.GetUser(ctx)
+
+	// EPIC X: Immutable topology — block channel changes for active host
+	if a.cnf.Shared.IsShared && a.isActiveHost(userID) {
+		return &apiError{err: errors.New("cannot create storage channel while shared workspace is active"), code: 403}
+	}
+
 	_, err := a.channelManager.CreateNewChannel(ctx, req.ChannelName, userID, false)
 	if err != nil {
 		return &apiError{err: err}
@@ -94,8 +100,14 @@ func (a *apiService) UsersCreateChannel(ctx context.Context, req *api.Channel) e
 
 func (a *apiService) UsersDeleteChannel(ctx context.Context, params api.UsersDeleteChannelParams) error {
 	userId := auth.GetUser(ctx)
-	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.newMiddlewares(ctx, 5)...)
 	channelId, _ := strconv.ParseInt(params.ID, 10, 64)
+
+	// EPIC X: Immutable topology — block channel changes for active host
+	if a.cnf.Shared.IsShared && a.isHostChannelLocked(userId, channelId) {
+		return &apiError{err: errors.New("cannot delete locked storage channel while shared workspace is active"), code: 403}
+	}
+
+	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.newMiddlewares(ctx, 5)...)
 	peerStorage := tgstorage.NewPeerStorage(a.db, cache.KeyPeer(userId))
 	var (
 		channel *tg.Channel
@@ -300,6 +312,11 @@ func (a *apiService) UsersStats(ctx context.Context) (*api.UserConfig, error) {
 
 func (a *apiService) UsersUpdateChannel(ctx context.Context, req *api.ChannelUpdate) error {
 	userId := auth.GetUser(ctx)
+
+	// EPIC X: Immutable topology — block channel changes for active host
+	if a.cnf.Shared.IsShared && a.isActiveHost(userId) {
+		return &apiError{err: errors.New("cannot modify storage channel while shared workspace is active"), code: 403}
+	}
 
 	channel := &models.Channel{UserId: userId, Selected: true}
 

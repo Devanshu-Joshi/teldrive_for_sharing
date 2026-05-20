@@ -204,7 +204,13 @@ type extendedMiddleware struct {
 }
 
 func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/api/group/") {
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/group/") {
+		r.URL.Path = "/api" + path
+		m.srv.HandleGroupRoute(w, r)
+		return
+	}
+	if strings.HasPrefix(path, "/api/group/") {
 		m.srv.HandleGroupRoute(w, r)
 		return
 	}
@@ -250,7 +256,20 @@ func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var data map[string]any
 			if err := json.Unmarshal(rec.body.Bytes(), &data); err == nil {
 				data["sharedMode"] = m.srv.api.cnf.Shared.IsShared
-				data["sharedError"] = m.srv.api.cnf.Shared.SharedError
+				if m.srv.api.cnf.Shared.IsShared {
+					ctx, userId, _ := m.srv.authenticateUser(w, r)
+					if userId != 0 {
+						cap := m.srv.api.ValidateSharedCapability(ctx, userId)
+						data["sharedRole"] = cap.Role
+						data["sharedError"] = cap.Reason
+					} else {
+						data["sharedRole"] = "none"
+						data["sharedError"] = ""
+					}
+				} else {
+					data["sharedRole"] = "none"
+					data["sharedError"] = ""
+				}
 				newBody, _ := json.Marshal(data)
 				w.Write(newBody)
 				return

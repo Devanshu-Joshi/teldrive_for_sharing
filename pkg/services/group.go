@@ -121,43 +121,92 @@ func (e *extendedService) HandleGroupRoute(w http.ResponseWriter, r *http.Reques
 		e.LeaveGroup(w, r, ctx, userId)
 		return
 	}
+	if r.Method == http.MethodGet && r.URL.Path == "/api/group/channel-info" {
+		e.GetChannelInfo(w, r, ctx, userId)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/api/group/status" {
+		e.GetGroupStatus(w, r, ctx, userId)
+		return
+	}
+
+	if r.Method == http.MethodGet && r.URL.Path == "/api/group/pending" {
+		e.GetPendingMembers(w, r, ctx, userId)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/api/group/members" {
+		e.GetApprovedMembers(w, r, ctx, userId)
+		return
+	}
 
 	w.WriteHeader(http.StatusNotFound)
 	w.Write([]byte(`{"error": "Not Found"}`))
 }
 
-type ClaimRequest struct {
-	ChannelID   int64  `json:"channel_id"`
-	Fingerprint string `json:"fingerprint"`
+func (e *extendedService) GetChannelInfo(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
+	channelId, err := e.api.channelManager.CurrentChannel(ctx, userId)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error": "No default channel configured"}`))
+		return
+	}
+
+	var channel models.Channel
+	var channelName string
+	if err := e.api.db.Where("channel_id = ?", channelId).First(&channel).Error; err == nil {
+		channelName = channel.ChannelName
+	} else {
+		channelName = "Unknown Channel"
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"channelId":   channelId,
+		"channelName": channelName,
+	})
+}
+
+func (e *extendedService) GetGroupStatus(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
+	cap := e.api.ValidateSharedCapability(ctx, userId)
+	
+	var hostCount int64
+	e.api.db.Model(&models.GroupMember{}).Where("status = 'host'").Count(&hostCount)
+	hostExists := hostCount > 0
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"role":            cap.Role,
+		"hostExists":      hostExists,
+		"channelLocked":   hostExists, // If host exists, their channel is locked
+		"capabilityValid": cap.Valid,
+	})
 }
 
 // ClaimHost handles POST /api/group/claim - Claims the Host role transactionally.
 func (e *extendedService) ClaimHost(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
-	var req ClaimRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Auto-fetch current default channel
+	channelId, err := e.api.channelManager.CurrentChannel(ctx, userId)
+	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "Invalid JSON payload"}`))
-		return
-	}
-
-	if req.ChannelID == 0 || req.Fingerprint == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "channel_id and fingerprint are required"}`))
+		w.Write([]byte(`{"error": "You must set a default storage channel first"}`))
 		return
 	}
 
 	// Verify Telegram Channel Access using the user's client session
-	if !e.verifyChannelAccess(ctx, req.ChannelID) {
+	if !e.verifyChannelAccess(ctx, channelId) {
 		w.WriteHeader(http.StatusForbidden)
 		w.Write([]byte(`{"error": "You do not have access to this Telegram Channel or session is invalid"}`))
 		return
 	}
 
+	// Auto-compute fingerprint from encryption key
+	fingerprint := crypt.GetCryptoFingerprint(e.api.cnf.TG.Uploads.EncryptionKey)
+
 	// Generate the out-of-band group secret
 	groupSecret := utils.GenerateRandomSecret(32)
 
 	// Explicit database transaction to prevent concurrent claims or partial writes
-	err := e.api.db.Transaction(func(tx *gorm.DB) error {
+	err = e.api.db.Transaction(func(tx *gorm.DB) error {
 		var count int64
 		// Enforce Host Exclusivity inside the transaction
 		if err := tx.Model(&models.GroupMember{}).Where("status = 'host'").Count(&count).Error; err != nil {
@@ -167,14 +216,14 @@ func (e *extendedService) ClaimHost(w http.ResponseWriter, r *http.Request, ctx 
 			return newHttpError(http.StatusConflict, "host already exists")
 		}
 
-		doubleHash := crypt.ComputeGroupHash(req.Fingerprint, groupSecret)
+		doubleHash := crypt.ComputeGroupHash(fingerprint, groupSecret)
 
 		newHost := &models.GroupMember{
 			HostID:     userId,
 			MemberID:   userId,
 			Status:     "host",
 			StoredHash: &doubleHash,
-			ChannelID:  &req.ChannelID,
+			ChannelID:  &channelId,
 		}
 
 		return tx.Create(newHost).Error
@@ -199,39 +248,31 @@ func (e *extendedService) ClaimHost(w http.ResponseWriter, r *http.Request, ctx 
 	})
 }
 
-type JoinRequest struct {
-	Fingerprint string `json:"fingerprint"`
-}
-
 // RequestAccess handles POST /api/group/request - Guest requests access to join the group.
 func (e *extendedService) RequestAccess(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
-	var req JoinRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	groupSecret := e.api.cnf.Shared.GroupSecret
+	if groupSecret == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "Invalid JSON payload"}`))
-		return
-	}
-
-	if req.Fingerprint == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "fingerprint is required"}`))
-		return
-	}
-
-	if e.api.cnf.Shared.GroupSecret == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "Group secret is not configured in local config.toml"}`))
+		w.Write([]byte(`{"error": "No shared workspace secret configured."}`))
 		return
 	}
 
 	// Transaction to safely fetch, validate and insert access request
 	err := e.api.db.Transaction(func(tx *gorm.DB) error {
-		// 1. Fetch active host record
+		// 1. Fetch active host record. There MUST be exactly one host.
+		var count int64
+		if err := tx.Model(&models.GroupMember{}).Where("status = 'host'").Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 1 {
+			tx.Exec("TRUNCATE TABLE teldrive.group_members CASCADE")
+			return newHttpError(http.StatusNotFound, "group topology invalid or dismantled")
+		} else if count == 0 {
+			return newHttpError(http.StatusNotFound, "group topology invalid or dismantled")
+		}
+
 		var host models.GroupMember
 		if err := tx.Where("status = 'host'").First(&host).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return newHttpError(http.StatusNotFound, "no active host found in the database")
-			}
 			return err
 		}
 
@@ -241,7 +282,7 @@ func (e *extendedService) RequestAccess(w http.ResponseWriter, r *http.Request, 
 		}
 
 		// 3. Reject duplicate pending or approved requests
-		var count int64
+		count = 0
 		if err := tx.Model(&models.GroupMember{}).Where("member_id = ?", userId).Count(&count).Error; err != nil {
 			return err
 		}
@@ -261,9 +302,11 @@ func (e *extendedService) RequestAccess(w http.ResponseWriter, r *http.Request, 
 		if host.StoredHash == nil {
 			return newHttpError(http.StatusBadRequest, "host has no cryptographic fingerprint stored")
 		}
-		calculatedDoubleHash := crypt.ComputeGroupHash(req.Fingerprint, e.api.cnf.Shared.GroupSecret)
+		
+		fingerprint := crypt.GetCryptoFingerprint(e.api.cnf.TG.Uploads.EncryptionKey)
+		calculatedDoubleHash := crypt.ComputeGroupHash(fingerprint, groupSecret)
 		if *host.StoredHash != calculatedDoubleHash {
-			return newHttpError(http.StatusForbidden, "encryption key or group secret mismatch")
+			return newHttpError(http.StatusForbidden, "Shared workspace unavailable: secret or encryption key is invalid.")
 		}
 
 		// 6. Create the pending request record
@@ -327,9 +370,9 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 		return
 	}
 
-	if req.Action != "approve" && req.Action != "reject" {
+	if req.Action != "approve" && req.Action != "reject" && req.Action != "remove" {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "Invalid action. Must be 'approve' or 'reject'"}`))
+		w.Write([]byte(`{"error": "Invalid action. Must be 'approve', 'reject', or 'remove'"}`))
 		return
 	}
 
@@ -359,8 +402,11 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 			return err
 		}
 
-		if member.Status != "pending" {
+		if member.Status != "pending" && (req.Action == "approve" || req.Action == "reject") {
 			return newHttpError(http.StatusConflict, fmt.Sprintf("member is already in '%s' status", member.Status))
+		}
+		if member.Status != "approved" && req.Action == "remove" {
+			return newHttpError(http.StatusConflict, fmt.Sprintf("cannot remove member in '%s' status", member.Status))
 		}
 
 		if req.Action == "approve" {
@@ -379,6 +425,11 @@ func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ct
 			}
 		} else if req.Action == "reject" {
 			// Perform rejection (row deletion)
+			if err := tx.Where("member_id = ?", req.MemberID).Delete(&models.GroupMember{}).Error; err != nil {
+				return err
+			}
+		} else if req.Action == "remove" {
+			// Perform removal (row deletion)
 			if err := tx.Where("member_id = ?", req.MemberID).Delete(&models.GroupMember{}).Error; err != nil {
 				return err
 			}
@@ -472,10 +523,67 @@ func BuildVirtualRoot(db *gorm.DB, hostID int64) (api.File, error) {
 		ID:        api.NewOptString(fmt.Sprintf("virtual_%d", hostID)),
 		Name:      name,
 		Type:      api.FileTypeFolder,
+		MimeType:  api.NewOptString("drive/folder"),
 		Size:      api.NewOptInt64(0),
 		ParentId:  api.NewOptString("root"),
 		UpdatedAt: api.NewOptDateTime(time.Now().UTC()),
 	}
 
 	return virtualFile, nil
+}
+
+type MemberResponse struct {
+	UserId   int64  `json:"userId"`
+	Username string `json:"username"`
+	Status   string `json:"status"`
+}
+
+func (e *extendedService) getMembersByStatus(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64, status string) {
+	// Only host can view members
+	var host models.GroupMember
+	if err := e.api.db.Where("status = 'host' AND member_id = ?", userId).First(&host).Error; err != nil {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error": "unauthorized: caller is not the active host"}`))
+		return
+	}
+
+	var members []models.GroupMember
+	if err := e.api.db.Where("status = ?", status).Find(&members).Error; err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error": "failed to fetch members"}`))
+		return
+	}
+
+	var response []MemberResponse
+	for _, m := range members {
+		// skip the host themselves in the members list
+		if m.MemberID == host.HostID {
+			continue
+		}
+		var user models.User
+		username := fmt.Sprintf("User %d", m.MemberID)
+		if err := e.api.db.Where("user_id = ?", m.MemberID).First(&user).Error; err == nil {
+			if user.UserName != "" {
+				username = "@" + user.UserName
+			} else if user.Name != "" {
+				username = user.Name
+			}
+		}
+		response = append(response, MemberResponse{
+			UserId:   m.MemberID,
+			Username: username,
+			Status:   m.Status,
+		})
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+func (e *extendedService) GetPendingMembers(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
+	e.getMembersByStatus(w, r, ctx, userId, "pending")
+}
+
+func (e *extendedService) GetApprovedMembers(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
+	e.getMembersByStatus(w, r, ctx, userId, "approved")
 }

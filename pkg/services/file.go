@@ -642,36 +642,153 @@ func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdPa
 func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) (*api.FileList, error) {
 	userId := auth.GetUser(ctx)
 
-	// Phase 18A: Detect synthetic root request
-	if params.ParentId.Value == "root" {
-		// Detection triggered! Branch safely.
-		logging.FromContext(ctx).Info("Phase 18A: Synthetic root request detected",
-			zap.Int64("user_id", userId),
-			zap.String("parent_id", params.ParentId.Value))
+	isRoot := false
 
-		// Phase 18B: Synthetic Root Construction
-		if a.cnf.Shared.IsShared {
-			var member models.GroupMember
-			// Query the group_members table to check if the current user is an approved guest
-			if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&member).Error; err == nil {
-				// The guest is approved! Build the mock synthetic virtual root folder for their host.
-				virtualFolder, err := BuildVirtualRoot(a.db, member.HostID)
-				if err == nil {
-					// Return the synthetic overlay response immediately, completely bypassing normal physical root rendering
-					return &api.FileList{
-						Items: []api.File{virtualFolder},
-						Meta: api.Meta{
-							Count:       1,
-							TotalPages:  1,
-							CurrentPage: 1,
-						},
-					}, nil
+	if params.Path.IsSet() && params.Path.Value == "/" {
+		isRoot = true
+	}
+
+	if params.ParentId.IsSet() && (params.ParentId.Value == "" || params.ParentId.Value == "root") {
+		isRoot = true
+	}
+
+	if params.Path.IsSet() && strings.HasPrefix(params.Path.Value, "/@") {
+		isRoot = false
+	}
+
+	// Virtual path mount point translation layer
+	if params.Path.IsSet() && strings.HasPrefix(params.Path.Value, "/@") {
+		pathVal := params.Path.Value
+		trimmed := strings.TrimPrefix(pathVal, "/@")
+		var username, subpath string
+		if idx := strings.Index(trimmed, "/"); idx != -1 {
+			username = trimmed[:idx]
+			subpath = trimmed[idx:]
+		} else {
+			username = trimmed
+			subpath = "/"
+		}
+
+		var targetUser models.User
+		if err := a.db.Where("user_name = ?", username).First(&targetUser).Error; err != nil {
+			return nil, &apiError{err: errors.New("user not found"), code: 404}
+		}
+		targetUserID := targetUser.UserId
+
+		// Validate capability
+		cap := a.ValidateSharedCapability(ctx, userId)
+		if !cap.Valid {
+			return nil, &apiError{err: errors.New(cap.Reason), code: 403}
+		}
+
+		// Verify caller and target owner share the same host
+		if userId != targetUserID {
+			var callerHostID int64
+			if cap.Role == "host" {
+				callerHostID = userId
+			} else if cap.Role == "approved" {
+				var callerMember models.GroupMember
+				if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err != nil {
+					return nil, &apiError{err: errors.New("caller is not an approved member"), code: 403}
 				}
+				callerHostID = callerMember.HostID
+			} else {
+				return nil, &apiError{err: errors.New("unauthorized role"), code: 403}
+			}
+
+			var targetHostID int64
+			var targetMember models.GroupMember
+			if err := a.db.Where("member_id = ? AND status IN ('host', 'approved')", targetUserID).First(&targetMember).Error; err != nil {
+				return nil, &apiError{err: errors.New("target is not a member of any group"), code: 404}
+			}
+			targetHostID = targetMember.HostID
+
+			if callerHostID != targetHostID {
+				return nil, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
 			}
 		}
 
-		// Standalone fallback: If not in shared mode or not an approved guest,
-		// fall back to standard root rendering or empty listing.
+		// Translate path and set effective user ID
+		params.Path.SetTo(subpath)
+		userId = targetUserID
+
+		queryBuilder := &fileQueryBuilder{db: a.db}
+		res, err := queryBuilder.execute(&params, userId)
+		if err != nil {
+			return nil, err
+		}
+
+		if subpath == "/" {
+			for i := range res.Items {
+				if !res.Items[i].ParentId.IsSet() || res.Items[i].ParentId.Value == "" {
+					res.Items[i].ParentId.SetTo(fmt.Sprintf("virtual_%d", targetUserID))
+				}
+			}
+		}
+		return res, nil
+	}
+
+	// Phase 18A: Detect synthetic root request
+	if isRoot {
+		// Detection triggered! Branch safely.
+		logging.FromContext(ctx).Info("Phase 18A: Synthetic root request detected",
+			zap.Int64("user_id", userId),
+			zap.String("parent_id", params.ParentId.Value),
+			zap.String("path", params.Path.Value))
+
+		// Phase 18B: Synthetic Root Construction
+		cap := a.ValidateSharedCapability(ctx, userId)
+
+		logger := logging.FromContext(ctx)
+		logger.Info(
+			"shared capability",
+			zap.String("role", cap.Role),
+			zap.Bool("valid", cap.Valid),
+		)
+
+		if cap.Valid && (cap.Role == "host" || cap.Role == "approved") {
+			var virtualRoots []api.File
+
+			if cap.Role == "host" {
+				var members []models.GroupMember
+				if err := a.db.Where("host_id = ? AND status = 'approved'", userId).Find(&members).Error; err == nil {
+					for _, m := range members {
+						vFolder, err := BuildVirtualRoot(a.db, m.MemberID)
+						if err == nil {
+							virtualRoots = append(virtualRoots, vFolder)
+						}
+					}
+				}
+			} else if cap.Role == "approved" {
+				var callerMember models.GroupMember
+				if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err == nil {
+					var members []models.GroupMember
+					if err := a.db.Where("host_id = ? AND status IN ('host', 'approved') AND member_id != ?", callerMember.HostID, userId).Find(&members).Error; err == nil {
+						for _, m := range members {
+							vFolder, err := BuildVirtualRoot(a.db, m.MemberID)
+							if err == nil {
+								virtualRoots = append(virtualRoots, vFolder)
+							}
+						}
+					}
+				}
+			}
+
+			logger.Info(
+				"virtual roots generated",
+				zap.Int("count", len(virtualRoots)),
+			)
+
+			if len(virtualRoots) > 0 {
+				queryBuilder := &fileQueryBuilder{db: a.db}
+				res, err := queryBuilder.execute(&params, userId)
+				if err == nil {
+					res.Items = append(virtualRoots, res.Items...)
+					res.Meta.Count += len(virtualRoots)
+					return res, nil
+				}
+			}
+		}
 	}
 
 	// Phase 18C: Validate and parse virtual ID if request parent folder ID starts with virtual_
@@ -682,17 +799,41 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 		}
 
 		// Phase 18D: Virtual Subfolder Interception
+		cap := a.ValidateSharedCapability(ctx, userId)
+		if !cap.Valid {
+			return nil, &apiError{err: errors.New(cap.Reason), code: 403}
+		}
+
 		// Ensure the host exists
 		var hostUser models.User
 		if err := a.db.Where("user_id = ?", hostID).First(&hostUser).Error; err != nil {
 			return nil, &apiError{err: errors.New("host user not found"), code: 404}
 		}
 
-		// Ensure caller is authorized (either the host or an approved guest)
+		// Ensure caller is authorized (either they are the same user, or they share the same group host)
 		if userId != hostID {
-			var member models.GroupMember
-			if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, hostID).First(&member).Error; err != nil {
-				return nil, &apiError{err: errors.New("unauthorized guest access"), code: 403}
+			var callerHostID int64
+			if cap.Role == "host" {
+				callerHostID = userId
+			} else if cap.Role == "approved" {
+				var callerMember models.GroupMember
+				if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err != nil {
+					return nil, &apiError{err: errors.New("caller is not an approved member"), code: 403}
+				}
+				callerHostID = callerMember.HostID
+			} else {
+				return nil, &apiError{err: errors.New("unauthorized role"), code: 403}
+			}
+
+			var targetHostID int64
+			var targetMember models.GroupMember
+			if err := a.db.Where("member_id = ? AND status IN ('host', 'approved')", hostID).First(&targetMember).Error; err != nil {
+				return nil, &apiError{err: errors.New("target is not a member of any group"), code: 404}
+			}
+			targetHostID = targetMember.HostID
+
+			if callerHostID != targetHostID {
+				return nil, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
 			}
 		}
 
@@ -722,10 +863,33 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 		var parentFolder models.File
 		if err := a.db.Where("id = ? AND type = 'folder'", params.ParentId.Value).First(&parentFolder).Error; err == nil {
 			if parentFolder.UserId != userId {
-				// Dynamically verify that the guest is an approved member of that host.
-				var member models.GroupMember
-				if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, parentFolder.UserId).First(&member).Error; err != nil {
-					return nil, &apiError{err: errors.New("unauthorized guest access"), code: 403}
+				cap := a.ValidateSharedCapability(ctx, userId)
+				if !cap.Valid {
+					return nil, &apiError{err: errors.New(cap.Reason), code: 403}
+				}
+				// Verify caller and parentFolder owner share the same host
+				var callerHostID int64
+				if cap.Role == "host" {
+					callerHostID = userId
+				} else if cap.Role == "approved" {
+					var callerMember models.GroupMember
+					if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err != nil {
+						return nil, &apiError{err: errors.New("caller is not an approved member"), code: 403}
+					}
+					callerHostID = callerMember.HostID
+				} else {
+					return nil, &apiError{err: errors.New("unauthorized role"), code: 403}
+				}
+
+				var targetHostID int64
+				var targetMember models.GroupMember
+				if err := a.db.Where("member_id = ? AND status IN ('host', 'approved')", parentFolder.UserId).First(&targetMember).Error; err != nil {
+					return nil, &apiError{err: errors.New("target is not a member of any group"), code: 404}
+				}
+				targetHostID = targetMember.HostID
+
+				if callerHostID != targetHostID {
+					return nil, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
 				}
 
 				// Delegate directory query execution to GORM query builder under the host's context.
@@ -1133,6 +1297,44 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		return
 	}
 
+	// Requirement 8: Shared Stream Isolation
+	if file.UserId != session.UserId {
+		cap := e.api.ValidateSharedCapability(ctx, session.UserId)
+		if !cap.Valid {
+			http.Error(w, "Shared workspace unavailable: secret or encryption key is invalid.", http.StatusForbidden)
+			return
+		}
+
+		// Verify caller and file owner share the same host
+		var callerHostID int64
+		if cap.Role == "host" {
+			callerHostID = session.UserId
+		} else if cap.Role == "approved" {
+			var callerMember models.GroupMember
+			if err := e.api.db.Where("member_id = ? AND status = 'approved'", session.UserId).First(&callerMember).Error; err != nil {
+				http.Error(w, "unauthorized guest access", http.StatusForbidden)
+				return
+			}
+			callerHostID = callerMember.HostID
+		} else {
+			http.Error(w, "unauthorized role", http.StatusForbidden)
+			return
+		}
+
+		var targetHostID int64
+		var targetMember models.GroupMember
+		if err := e.api.db.Where("member_id = ? AND status IN ('host', 'approved')", file.UserId).First(&targetMember).Error; err != nil {
+			http.Error(w, "target not found in group", http.StatusNotFound)
+			return
+		}
+		targetHostID = targetMember.HostID
+
+		if callerHostID != targetHostID {
+			http.Error(w, "unauthorized: users are not in the same shared group", http.StatusForbidden)
+			return
+		}
+	}
+
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	var start, end int64
@@ -1360,11 +1562,36 @@ func (a *apiService) ClassifyUploadTarget(ctx context.Context, parentId string, 
 			return 0, false, &apiError{err: errors.New("host user not found"), code: 404}
 		}
 
-		// Enforce dynamic authorization: guest must be approved by the host
+		// Enforce dynamic authorization: guest must be approved by the host AND have valid capabilities
 		if userId != hostID {
-			var member models.GroupMember
-			if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, hostID).First(&member).Error; err != nil {
-				return 0, false, &apiError{err: errors.New("unauthorized guest upload access"), code: 403}
+			cap := a.ValidateSharedCapability(ctx, userId)
+			if !cap.Valid {
+				return 0, false, &apiError{err: errors.New("unauthorized upload access: " + cap.Reason), code: 403}
+			}
+
+			// Verify caller and target owner share the same host
+			var callerHostID int64
+			if cap.Role == "host" {
+				callerHostID = userId
+			} else if cap.Role == "approved" {
+				var callerMember models.GroupMember
+				if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err != nil {
+					return 0, false, &apiError{err: errors.New("caller is not an approved member"), code: 403}
+				}
+				callerHostID = callerMember.HostID
+			} else {
+				return 0, false, &apiError{err: errors.New("unauthorized role"), code: 403}
+			}
+
+			var targetHostID int64
+			var targetMember models.GroupMember
+			if err := a.db.Where("member_id = ? AND status IN ('host', 'approved')", hostID).First(&targetMember).Error; err != nil {
+				return 0, false, &apiError{err: errors.New("target is not a member of any group"), code: 404}
+			}
+			targetHostID = targetMember.HostID
+
+			if callerHostID != targetHostID {
+				return 0, false, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
 			}
 		}
 
@@ -1376,10 +1603,34 @@ func (a *apiService) ClassifyUploadTarget(ctx context.Context, parentId string, 
 		var parentFolder models.File
 		if err := a.db.Where("id = ? AND type = 'folder'", parentId).First(&parentFolder).Error; err == nil {
 			if parentFolder.UserId != userId {
-				// Enforce dynamic authorization: guest must be approved by the folder owner (host)
-				var member models.GroupMember
-				if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, parentFolder.UserId).First(&member).Error; err != nil {
-					return 0, false, &apiError{err: errors.New("unauthorized guest upload access"), code: 403}
+				cap := a.ValidateSharedCapability(ctx, userId)
+				if !cap.Valid {
+					return 0, false, &apiError{err: errors.New("unauthorized upload access: " + cap.Reason), code: 403}
+				}
+
+				// Verify caller and parentFolder owner share the same host
+				var callerHostID int64
+				if cap.Role == "host" {
+					callerHostID = userId
+				} else if cap.Role == "approved" {
+					var callerMember models.GroupMember
+					if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err != nil {
+						return 0, false, &apiError{err: errors.New("caller is not an approved member"), code: 403}
+					}
+					callerHostID = callerMember.HostID
+				} else {
+					return 0, false, &apiError{err: errors.New("unauthorized role"), code: 403}
+				}
+
+				var targetHostID int64
+				var targetMember models.GroupMember
+				if err := a.db.Where("member_id = ? AND status IN ('host', 'approved')", parentFolder.UserId).First(&targetMember).Error; err != nil {
+					return 0, false, &apiError{err: errors.New("target is not a member of any group"), code: 404}
+				}
+				targetHostID = targetMember.HostID
+
+				if callerHostID != targetHostID {
+					return 0, false, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
 				}
 				return parentFolder.UserId, true, nil
 			}
@@ -1395,9 +1646,34 @@ func (a *apiService) ClassifyUploadTarget(ctx context.Context, parentId string, 
 			var folder models.File
 			if err := a.db.Where("id = ? AND type = 'folder'", *resolvedID).First(&folder).Error; err == nil {
 				if folder.UserId != userId {
-					var member models.GroupMember
-					if err := a.db.Where("member_id = ? AND host_id = ? AND status = 'approved'", userId, folder.UserId).First(&member).Error; err != nil {
-						return 0, false, &apiError{err: errors.New("unauthorized guest upload access"), code: 403}
+					cap := a.ValidateSharedCapability(ctx, userId)
+					if !cap.Valid {
+						return 0, false, &apiError{err: errors.New("unauthorized upload access: " + cap.Reason), code: 403}
+					}
+
+					// Verify caller and folder owner share the same host
+					var callerHostID int64
+					if cap.Role == "host" {
+						callerHostID = userId
+					} else if cap.Role == "approved" {
+						var callerMember models.GroupMember
+						if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err != nil {
+							return 0, false, &apiError{err: errors.New("caller is not an approved member"), code: 403}
+						}
+						callerHostID = callerMember.HostID
+					} else {
+						return 0, false, &apiError{err: errors.New("unauthorized role"), code: 403}
+					}
+
+					var targetHostID int64
+					var targetMember models.GroupMember
+					if err := a.db.Where("member_id = ? AND status IN ('host', 'approved')", folder.UserId).First(&targetMember).Error; err != nil {
+						return 0, false, &apiError{err: errors.New("target is not a member of any group"), code: 404}
+					}
+					targetHostID = targetMember.HostID
+
+					if callerHostID != targetHostID {
+						return 0, false, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
 					}
 					return folder.UserId, true, nil
 				}
