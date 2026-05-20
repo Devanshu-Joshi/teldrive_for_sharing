@@ -51,9 +51,20 @@ func (s *MemoryBotSelector) Next(ctx context.Context, op BotOp, userID int64, bo
 	defer s.mu.Unlock()
 
 	key := selectorKey(op, userID)
-	idx := s.currIdx[key]
-	s.currIdx[key] = (idx + 1) % len(bots)
-	return bots[idx], idx, nil
+	startIdx := s.currIdx[key]
+	state := GetGlobalTokenState()
+
+	for i := 0; i < len(bots); i++ {
+		idx := (startIdx + i) % len(bots)
+		token := bots[idx]
+		
+		if !state.IsOnCooldown(token) && !state.IsRevoked(token) {
+			s.currIdx[key] = (idx + 1) % len(bots)
+			return token, idx, nil
+		}
+	}
+
+	return "", 0, fmt.Errorf("all %d bots are currently unavailable (cooldown/revoked)", len(bots))
 }
 
 // RedisBotSelector provides Redis-backed round-robin bot selection.
@@ -74,17 +85,25 @@ func (s *RedisBotSelector) Next(ctx context.Context, op BotOp, userID int64, bot
 	}
 
 	key := fmt.Sprintf("teldrive:bot_idx:%s:%d", op, userID)
+	state := GetGlobalTokenState()
 
-	// Atomic increment in Redis
-	idx, err := s.client.Incr(ctx, key).Result()
-	if err != nil {
-		return "", 0, fmt.Errorf("redis incr failed: %w", err)
+	for i := 0; i < len(bots); i++ {
+		// Atomic increment in Redis
+		idx, err := s.client.Incr(ctx, key).Result()
+		if err != nil {
+			return "", 0, fmt.Errorf("redis incr failed: %w", err)
+		}
+
+		// Convert to 0-based index and wrap around
+		actualIdx := int((idx - 1) % int64(len(bots)))
+		token := bots[actualIdx]
+
+		if !state.IsOnCooldown(token) && !state.IsRevoked(token) {
+			return token, actualIdx, nil
+		}
 	}
 
-	// Convert to 0-based index and wrap around
-	actualIdx := int((idx - 1) % int64(len(bots)))
-
-	return bots[actualIdx], actualIdx, nil
+	return "", 0, fmt.Errorf("all %d bots are currently unavailable (cooldown/revoked)", len(bots))
 }
 
 func NewBotSelector(redisClient *redis.Client) BotSelector {

@@ -10,9 +10,12 @@ import (
 	"github.com/gotd/contrib/clock"
 	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/contrib/middleware/ratelimit"
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/config"
 	"github.com/tgdrive/teldrive/internal/logging"
@@ -113,6 +116,25 @@ func BotClient(ctx context.Context, db *gorm.DB, cache cache.Cacher, config *con
 	if err != nil {
 		return nil, err
 	}
+
+	cooldownMw := telegram.MiddlewareFunc(func(next tg.Invoker) telegram.InvokeFunc {
+		return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+			err := next.Invoke(ctx, input, output)
+			if err != nil {
+				if tgerr.Is(err, "FLOOD_WAIT", "FLOOD_WAIT_X") || strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "cooldown") {
+					GetGlobalTokenState().SetCooldown(token, time.Now().Add(60*time.Second))
+					// Wrap error to ensure it fails fast and bypasses gotd's built-in floodwait sleeping
+					return errors.New("bot token cooldown enforced: " + err.Error())
+				}
+			}
+			return err
+		}
+	})
+
+	// Append at the end of the slice so it sits directly above the network layer
+	// and catches the error before upper-level middlewares (like retry or floodwait) can intercept it.
+	middlewares = append(middlewares, cooldownMw)
+
 	// Storage must remain open for the client's entire lifetime
 	// It will be garbage collected when the client is no longer referenced
 	return newClient(ctx, config, nil, storage, middlewares...)
