@@ -148,14 +148,48 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 
 	var parentId string
 	if !isUUID(req.Destination) {
+		hostID, isVirtual, classifyErr := a.ClassifyUploadTarget(ctx, "", req.Destination, userId)
+		if classifyErr != nil {
+			return nil, classifyErr
+		}
+		if isVirtual && hostID != userId {
+			return nil, &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+		}
+
+		// Perform path translation for Destination
+		if req.Destination == "/My Files" {
+			req.Destination = "/"
+		} else if strings.HasPrefix(req.Destination, "/My Files/") {
+			req.Destination = strings.TrimPrefix(req.Destination, "/My Files")
+			if req.Destination == "" {
+				req.Destination = "/"
+			}
+		}
+
 		var destRes []models.File
-		if err := a.db.Raw("select * from teldrive.create_directories(?, ?)", userId, req.Destination).
+		if err := a.db.Raw("select * from teldrive.create_directories(?, ?)", hostID, req.Destination).
 			Scan(&destRes).Error; err != nil {
 			return nil, &apiError{err: err}
 		}
 		parentId = destRes[0].ID
 	} else {
-		parentId = req.Destination
+		if req.Destination == "virtual_self" {
+			parentId = ""
+		} else if strings.HasPrefix(req.Destination, "virtual_") {
+			hostID, _ := utils.ParseVirtualID(req.Destination)
+			if hostID != userId {
+				return nil, &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+			}
+			parentId = ""
+		} else {
+			var destFolder models.File
+			if err := a.db.Where("id = ? AND type = 'folder'", req.Destination).First(&destFolder).Error; err == nil {
+				if destFolder.UserId != userId {
+					return nil, &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+				}
+			}
+			parentId = req.Destination
+		}
 	}
 
 	dbFile := models.File{}
@@ -229,10 +263,44 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	if classifyErr != nil {
 		return nil, classifyErr
 	}
+	if isVirtual && hostID != userId {
+		return nil, &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+	}
 	logging.FromContext(ctx).Info("Phase 20 Upload Classification Readiness",
 		zap.Int64("caller_id", userId),
 		zap.Int64("target_host_id", hostID),
 		zap.Bool("is_virtual", isVirtual))
+
+	// Translate self paths and virtual mount paths for file/folder creation after classification
+	if fileIn.Path.IsSet() {
+		val := fileIn.Path.Value
+		if val == "/My Files" {
+			fileIn.Path.SetTo("/")
+		} else if strings.HasPrefix(val, "/My Files/") {
+			sub := strings.TrimPrefix(val, "/My Files")
+			if sub == "" {
+				sub = "/"
+			}
+			fileIn.Path.SetTo(sub)
+		} else if strings.HasPrefix(val, "/@") {
+			trimmed := strings.TrimPrefix(val, "/@")
+			var subpath string
+			if idx := strings.Index(trimmed, "/"); idx != -1 {
+				subpath = trimmed[idx:]
+			} else {
+				subpath = "/"
+			}
+			fileIn.Path.SetTo(subpath)
+		}
+	}
+
+	if fileIn.ParentId.IsSet() {
+		if fileIn.ParentId.Value == "virtual_self" {
+			fileIn.ParentId.SetTo("")
+		} else if strings.HasPrefix(fileIn.ParentId.Value, "virtual_") {
+			fileIn.ParentId.SetTo("")
+		}
+	}
 
 	var (
 		fileDB    models.File
@@ -513,6 +581,16 @@ func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error
 		}
 	}
 
+	// Authoritative security check: user must own all files being deleted
+	var targetFiles []models.File
+	if err := a.db.Where("id IN ?", req.Ids).Find(&targetFiles).Error; err == nil {
+		for _, file := range targetFiles {
+			if file.UserId != userId {
+				return &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+			}
+		}
+	}
+
 	var fileDB models.File
 
 	if err := a.db.Model(&models.File{}).Where("id = ?", req.Ids[0]).Where("user_id = ?", userId).
@@ -652,7 +730,7 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 		isRoot = true
 	}
 
-	if params.Path.IsSet() && strings.HasPrefix(params.Path.Value, "/@") {
+	if params.Path.IsSet() && (strings.HasPrefix(params.Path.Value, "/@") || params.Path.Value == "/My Files" || strings.HasPrefix(params.Path.Value, "/My Files/")) {
 		isRoot = false
 	}
 
@@ -728,6 +806,47 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 		return res, nil
 	}
 
+	// Self path translation layer
+	isSelfPath := false
+	var selfSubpath string
+	if params.Path.IsSet() {
+		if params.Path.Value == "/My Files" {
+			isSelfPath = true
+			selfSubpath = "/"
+		} else if strings.HasPrefix(params.Path.Value, "/My Files/") {
+			isSelfPath = true
+			selfSubpath = strings.TrimPrefix(params.Path.Value, "/My Files")
+			if selfSubpath == "" {
+				selfSubpath = "/"
+			}
+		}
+	}
+
+	if isSelfPath {
+		cap := a.ValidateSharedCapability(ctx, userId)
+		if !cap.Valid {
+			return nil, &apiError{err: errors.New(cap.Reason), code: 403}
+		}
+
+		// Translate path
+		params.Path.SetTo(selfSubpath)
+
+		queryBuilder := &fileQueryBuilder{db: a.db}
+		res, err := queryBuilder.execute(&params, userId)
+		if err != nil {
+			return nil, err
+		}
+
+		if selfSubpath == "/" {
+			for i := range res.Items {
+				if !res.Items[i].ParentId.IsSet() || res.Items[i].ParentId.Value == "" {
+					res.Items[i].ParentId.SetTo("virtual_self")
+				}
+			}
+		}
+		return res, nil
+	}
+
 	// Phase 18A: Detect synthetic root request
 	if isRoot {
 		// Detection triggered! Branch safely.
@@ -749,6 +868,18 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 		if cap.Valid && (cap.Role == "host" || cap.Role == "approved") {
 			var virtualRoots []api.File
 
+			// 1. Add synthetic self root folder
+			virtualRoots = append(virtualRoots, api.File{
+				ID:        api.NewOptString("virtual_self"),
+				Name:      "My Files",
+				Type:      api.FileTypeFolder,
+				MimeType:  api.NewOptString("drive/folder"),
+				Size:      api.NewOptInt64(0),
+				ParentId:  api.NewOptString("root"),
+				UpdatedAt: api.NewOptDateTime(time.Now().UTC()),
+			})
+
+			// 2. Add peer virtual roots
 			if cap.Role == "host" {
 				var members []models.GroupMember
 				if err := a.db.Where("host_id = ? AND status = 'approved'", userId).Find(&members).Error; err == nil {
@@ -779,16 +910,40 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 				zap.Int("count", len(virtualRoots)),
 			)
 
-			if len(virtualRoots) > 0 {
-				queryBuilder := &fileQueryBuilder{db: a.db}
-				res, err := queryBuilder.execute(&params, userId)
-				if err == nil {
-					res.Items = append(virtualRoots, res.Items...)
-					res.Meta.Count += len(virtualRoots)
-					return res, nil
-				}
+			// Return ONLY virtual roots
+			res := &api.FileList{
+				Items: virtualRoots,
+				Meta: api.Meta{
+					Count: len(virtualRoots),
+				},
+			}
+			return res, nil
+		}
+	}
+
+	// Intercept virtual_self parentId
+	if params.ParentId.Value == "virtual_self" {
+		cap := a.ValidateSharedCapability(ctx, userId)
+		if !cap.Valid {
+			return nil, &apiError{err: errors.New(cap.Reason), code: 403}
+		}
+
+		// Rewrite query scope to query the caller's physical root
+		params.ParentId.SetTo("nil")
+
+		queryBuilder := &fileQueryBuilder{db: a.db}
+		res, err := queryBuilder.execute(&params, userId)
+		if err != nil {
+			return nil, err
+		}
+
+		// Map root folder parent IDs back to virtual_self parent ID contract
+		for i := range res.Items {
+			if !res.Items[i].ParentId.IsSet() || res.Items[i].ParentId.Value == "" {
+				res.Items[i].ParentId.SetTo("virtual_self")
 			}
 		}
+		return res, nil
 	}
 
 	// Phase 18C: Validate and parse virtual ID if request parent folder ID starts with virtual_
@@ -907,7 +1062,27 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 func (a *apiService) FilesMkdir(ctx context.Context, req *api.FileMkDir) error {
 	userId := auth.GetUser(ctx)
 
-	if err := a.db.Exec("select * from teldrive.create_directories(?, ?)", userId, req.Path).Error; err != nil {
+	hostID, isVirtual, classifyErr := a.ClassifyUploadTarget(ctx, "", req.Path, userId)
+	if classifyErr != nil {
+		return classifyErr
+	}
+	if isVirtual && hostID != userId {
+		return &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+	}
+
+	// Translate path for creation
+	if req.Path != "" {
+		if req.Path == "/My Files" {
+			req.Path = "/"
+		} else if strings.HasPrefix(req.Path, "/My Files/") {
+			req.Path = strings.TrimPrefix(req.Path, "/My Files")
+			if req.Path == "" {
+				req.Path = "/"
+			}
+		}
+	}
+
+	if err := a.db.Exec("select * from teldrive.create_directories(?, ?)", hostID, req.Path).Error; err != nil {
 		return &apiError{err: err}
 	}
 	return nil
@@ -915,6 +1090,10 @@ func (a *apiService) FilesMkdir(ctx context.Context, req *api.FileMkDir) error {
 
 func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 	userId := auth.GetUser(ctx)
+
+	if req.DestinationParent == "virtual_self" {
+		req.DestinationParent = ""
+	}
 
 	for _, id := range req.Ids {
 		if utils.IsVirtualID(id) {
@@ -926,16 +1105,51 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 	}
 
 	var destParentID *string
+	var destOwner int64 = userId // Default destination owner is caller
 
-	if !isUUID(req.DestinationParent) {
-		r, err := resolvePathID(a.db, req.DestinationParent, userId)
-		if err != nil {
-			return &apiError{err: err}
+	if req.DestinationParent != "" {
+		if !isUUID(req.DestinationParent) {
+			// Path-based destination
+			hostID, isVirtual, classifyErr := a.ClassifyUploadTarget(ctx, "", req.DestinationParent, userId)
+			if classifyErr != nil {
+				return classifyErr
+			}
+			if isVirtual && hostID != userId {
+				return &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+			}
+			destOwner = hostID
+
+			// Translate path
+			if req.DestinationParent == "/My Files" {
+				req.DestinationParent = "/"
+			} else if strings.HasPrefix(req.DestinationParent, "/My Files/") {
+				req.DestinationParent = strings.TrimPrefix(req.DestinationParent, "/My Files")
+				if req.DestinationParent == "" {
+					req.DestinationParent = "/"
+				}
+			} else if strings.HasPrefix(req.DestinationParent, "/@") {
+				trimmed := strings.TrimPrefix(req.DestinationParent, "/@")
+				if idx := strings.Index(trimmed, "/"); idx != -1 {
+					req.DestinationParent = trimmed[idx:]
+				} else {
+					req.DestinationParent = "/"
+				}
+			}
+
+			r, err := resolvePathID(a.db, req.DestinationParent, destOwner)
+			if err != nil {
+				return &apiError{err: err}
+			}
+			destParentID = r
+		} else {
+			// UUID destination
+			destParentID = &req.DestinationParent
+			var destFile models.File
+			if err := a.db.Model(&models.File{}).Where("id = ?", *destParentID).First(&destFile).Error; err != nil {
+				return &apiError{err: err}
+			}
+			destOwner = destFile.UserId
 		}
-		destParentID = r
-
-	} else {
-		destParentID = &req.DestinationParent
 	}
 
 	if len(req.Ids) == 0 {
@@ -958,21 +1172,16 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 		}
 	}
 
-
-	var destOwner int64
-	if destParentID == nil || *destParentID == "" || *destParentID == "00000000-0000-0000-0000-000000000000" {
-		destOwner = srcOwner
-		destParentID = nil
-	} else {
-		var destFile models.File
-		if err := a.db.Model(&models.File{}).Where("id = ?", *destParentID).First(&destFile).Error; err != nil {
-			return &apiError{err: err}
-		}
-		destOwner = destFile.UserId
+	if srcOwner != userId {
+		return &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
 	}
 
-	if srcOwner != destOwner {
-		return &apiError{err: errors.New("cannot move files across different partition owners"), code: 403}
+	if destOwner != userId {
+		return &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+	}
+
+	if destParentID == nil || *destParentID == "" || *destParentID == "00000000-0000-0000-0000-000000000000" {
+		destParentID = nil
 	}
 
 	if destParentID != nil {
@@ -983,7 +1192,7 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 			FROM teldrive.files
 			WHERE id = ANY(?) AND status = 'active'
 			UNION ALL
-			SELECT f.id, f.parent_id, d.path || f.id
+			SELECT f.id, f.parent_id, d.path || f.id::text
 			FROM teldrive.files f
 			INNER JOIN descendants d ON f.parent_id = d.id
 			WHERE f.status = 'active' AND NOT (f.id = ANY(d.path))
@@ -1111,14 +1320,38 @@ func (a *apiService) FilesShareByid(ctx context.Context, params api.FilesShareBy
 }
 
 func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, params api.FilesUpdateParams) (*api.File, error) {
+	userId := auth.GetUser(ctx)
+
+	// Translate virtual_self ParentId
+	if req.ParentId.IsSet() && req.ParentId.Value == "virtual_self" {
+		req.ParentId.SetTo("")
+	}
+
 	if utils.IsVirtualID(params.ID) {
 		return nil, &apiError{err: errors.New("cannot update virtual folders"), code: 400}
 	}
-	if req.ParentId.IsSet() && utils.IsVirtualID(req.ParentId.Value) {
+	if req.ParentId.IsSet() && req.ParentId.Value != "" && utils.IsVirtualID(req.ParentId.Value) {
 		return nil, &apiError{err: errors.New("cannot set parent to a virtual folder"), code: 400}
 	}
 
-	userId := auth.GetUser(ctx)
+	// Authoritative security check: user must own the target file
+	var targetFile models.File
+	if err := a.db.Where("id = ?", params.ID).First(&targetFile).Error; err != nil {
+		return nil, &apiError{err: err}
+	}
+	if targetFile.UserId != userId {
+		return nil, &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+	}
+
+	// Authoritative security check: user must own the new parent folder (if set)
+	if req.ParentId.IsSet() && req.ParentId.Value != "" {
+		var parentFolder models.File
+		if err := a.db.Where("id = ? AND type = 'folder'", req.ParentId.Value).First(&parentFolder).Error; err == nil {
+			if parentFolder.UserId != userId {
+				return nil, &apiError{err: errors.New("Shared member filesystems are read-only."), code: 403}
+			}
+		}
+	}
 
 	updateDb := models.File{}
 	isContentUpdate := false
@@ -1550,6 +1783,10 @@ func mapParts(_parts []api.Part) []api.Part {
 // It returns (hostID, isVirtual, error).
 func (a *apiService) ClassifyUploadTarget(ctx context.Context, parentId string, path string, userId int64) (int64, bool, error) {
 	// 1. Check for synthetic virtual root upload target
+	if parentId == "virtual_self" {
+		return userId, false, nil
+	}
+
 	if parentId != "" && strings.HasPrefix(parentId, "virtual_") {
 		hostID, err := utils.ParseVirtualID(parentId)
 		if err != nil {
@@ -1639,10 +1876,70 @@ func (a *apiService) ClassifyUploadTarget(ctx context.Context, parentId string, 
 
 	// 3. Check for path-based resolution target
 	if path != "" && parentId == "" {
-		// Resolve path under current caller's context first
+		// Translation layer for paths inside ClassifyUploadTarget
+		if path == "/My Files" {
+			path = "/"
+		} else if strings.HasPrefix(path, "/My Files/") {
+			path = strings.TrimPrefix(path, "/My Files")
+			if path == "" {
+				path = "/"
+			}
+		} else if strings.HasPrefix(path, "/@") {
+			trimmed := strings.TrimPrefix(path, "/@")
+			var username, subpath string
+			if idx := strings.Index(trimmed, "/"); idx != -1 {
+				username = trimmed[:idx]
+				subpath = trimmed[idx:]
+			} else {
+				username = trimmed
+				subpath = "/"
+			}
+
+			var targetUser models.User
+			if err := a.db.Where("user_name = ?", username).First(&targetUser).Error; err == nil {
+				resolvedID, err := resolvePathID(a.db, subpath, targetUser.UserId)
+				if err == nil && resolvedID != nil {
+					var folder models.File
+					if err := a.db.Where("id = ? AND type = 'folder'", *resolvedID).First(&folder).Error; err == nil {
+						cap := a.ValidateSharedCapability(ctx, userId)
+						if !cap.Valid {
+							return 0, false, &apiError{err: errors.New("unauthorized upload access: " + cap.Reason), code: 403}
+						}
+
+						if userId != targetUser.UserId {
+							var callerHostID int64
+							if cap.Role == "host" {
+								callerHostID = userId
+							} else if cap.Role == "approved" {
+								var callerMember models.GroupMember
+								if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err != nil {
+									return 0, false, &apiError{err: errors.New("caller is not an approved member"), code: 403}
+								}
+								callerHostID = callerMember.HostID
+							} else {
+								return 0, false, &apiError{err: errors.New("unauthorized role"), code: 403}
+							}
+
+							var targetHostID int64
+							var targetMember models.GroupMember
+							if err := a.db.Where("member_id = ? AND status IN ('host', 'approved')", targetUser.UserId).First(&targetMember).Error; err != nil {
+								return 0, false, &apiError{err: errors.New("target is not a member of any group"), code: 404}
+							}
+							targetHostID = targetMember.HostID
+
+							if callerHostID != targetHostID {
+								return 0, false, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
+							}
+						}
+						return targetUser.UserId, true, nil
+					}
+				}
+			}
+		}
+
+		// Resolve path under current caller's context
 		resolvedID, err := resolvePathID(a.db, path, userId)
 		if err == nil && resolvedID != nil {
-			// If resolved, verify its owner in case it's not the caller (not normally possible for path resolution under userId)
 			var folder models.File
 			if err := a.db.Where("id = ? AND type = 'folder'", *resolvedID).First(&folder).Error; err == nil {
 				if folder.UserId != userId {
