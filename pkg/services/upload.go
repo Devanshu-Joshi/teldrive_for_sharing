@@ -249,6 +249,10 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 		message, err := a.uploadToTelegram(ctx, client, channelId, &params, fileStream, fileSize, logger)
 
 		if err != nil {
+			if isChannelAccessError(err) {
+				logger.Warn("upload.failed_channel_inaccessible", zap.Int64("channel_id", channelId), zap.Error(err))
+				return fmt.Errorf("upload channel inaccessible: %w", err)
+			}
 			return err
 		}
 
@@ -335,4 +339,23 @@ func generateRandomSalt() (string, error) {
 	hashedSalt := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
 
 	return hashedSalt, nil
+}
+
+func isChannelAccessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToUpper(err.Error())
+	channelPatterns := []string{
+		"CHANNEL_INVALID",
+		"CHANNEL_PRIVATE",
+		"CHAT_ADMIN_REQUIRED",
+		"CHAT_WRITE_FORBIDDEN",
+	}
+	for _, pattern := range channelPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+	return false
 }

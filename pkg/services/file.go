@@ -1256,6 +1256,11 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		handleStream := func() error {
 			parts, err := getParts(ctx, client, e.api.cache, file)
 			if err != nil {
+				if isChannelAccessError(err) {
+					logger.Warn("stream.channel_inaccessible", zap.Error(err))
+					http.Error(w, "stream channel inaccessible: "+err.Error(), http.StatusForbidden)
+					return nil
+				}
 				logger.Error("stream.parts_fetch_failed", zap.Error(err))
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return nil
@@ -1273,6 +1278,11 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			)
 
 			if err != nil {
+				if isChannelAccessError(err) {
+					logger.Warn("stream.channel_inaccessible", zap.Error(err))
+					http.Error(w, "stream channel inaccessible: "+err.Error(), http.StatusForbidden)
+					return nil
+				}
 				logger.Error("stream.reader_create_failed", zap.Error(err))
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return nil
@@ -1286,6 +1296,9 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			_, err = io.CopyN(w, lr, contentLength)
 			if err != nil {
 				lr.Close()
+				if isChannelAccessError(err) {
+					logger.Warn("stream.interrupted_channel_inaccessible", zap.Error(err))
+				}
 			}
 			return nil
 		}
