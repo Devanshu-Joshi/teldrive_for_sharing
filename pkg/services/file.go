@@ -44,30 +44,13 @@ var (
 	defaultContentType   = "application/octet-stream"
 )
 
-const peerSharedChannelVisibilitySQL = `(
-	(type = 'file' AND channel_id = ?)
-	OR
-	(type = 'folder' AND EXISTS (
-		WITH RECURSIVE subtree AS (
-			SELECT id, parent_id, type, channel_id
-			FROM teldrive.files
-			WHERE parent_id = files.id
-				AND status = files.status
-				AND user_id = files.user_id
-			UNION ALL
-			SELECT f.id, f.parent_id, f.type, f.channel_id
-			FROM teldrive.files f
-			JOIN subtree s ON f.parent_id = s.id
-			WHERE f.status = files.status
-				AND f.user_id = files.user_id
-		)
-		SELECT 1
-		FROM subtree s
-		WHERE s.type = 'file'
-			AND s.channel_id = ?
-		LIMIT 1
-	))
-)`
+const peerSharedChannelVisibilitySQL = `
+(
+    type = 'folder'
+    OR
+    (type = 'file' AND channel_id = ?)
+)
+`
 
 func isUUID(str string) bool {
 	_, err := uuid.Parse(str)
@@ -847,7 +830,7 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 			return nil, &apiError{err: errors.New("host channel is missing"), code: 500}
 		}
 
-		queryBuilder := &fileQueryBuilder{db: a.db.Where(peerSharedChannelVisibilitySQL, *cap.ChannelID, *cap.ChannelID)}
+		queryBuilder := &fileQueryBuilder{db: a.db.Where(peerSharedChannelVisibilitySQL, *cap.ChannelID)}
 		res, err := queryBuilder.execute(&params, targetUserID)
 		if err != nil {
 			return nil, err
@@ -1108,7 +1091,7 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 				}
 
 				// Delegate directory query execution to GORM query builder under the host's context.
-				queryBuilder := &fileQueryBuilder{db: a.db.Where(peerSharedChannelVisibilitySQL, *cap.ChannelID, *cap.ChannelID)}
+				queryBuilder := &fileQueryBuilder{db: a.db.Where(peerSharedChannelVisibilitySQL, *cap.ChannelID)}
 				return queryBuilder.execute(&params, parentFolder.UserId)
 			}
 		}
