@@ -27,55 +27,98 @@ type fileResponse struct {
 
 const folderCategory = "folder"
 
-var selectedFields = []string{"id", "name", "type", "mime_type", "category", "hash", "channel_id", "encrypted", "size", "parent_id", "updated_at"}
+var selectedFields = []string{
+	"id",
+	"name",
+	"type",
+	"mime_type",
+	"category",
+	"hash",
+	"channel_id",
+	"encrypted",
+	"size",
+	"parent_id",
+	"updated_at",
+}
 
 func (afb *fileQueryBuilder) execute(filesQuery *api.FilesListParams, userId int64) (*api.FileList, error) {
-	query := afb.db.Where("user_id = ?", userId).Where("status = ?", filesQuery.Status.Value)
+	query := afb.db.
+		Where("user_id = ?", userId).
+		Where("status = ?", filesQuery.Status.Value)
+
 	switch filesQuery.Operation.Value {
 	case api.FileQueryOperationList:
 		query = afb.applyListFilters(query, filesQuery, userId)
+
 	case api.FileQueryOperationFind:
 		var err error
+
 		query, err = afb.applyFindFilters(query, filesQuery, userId)
 		if err != nil {
-			return nil, &apiError{err: err, code: 400}
+			return nil, &apiError{
+				err:  err,
+				code: 400,
+			}
 		}
-
 	}
+
 	query = afb.buildFileQuery(query, filesQuery, userId)
+
 	res := []fileResponse{}
+
 	if err := query.Scan(&res).Error; err != nil {
 		if strings.Contains(err.Error(), "file not found") {
-			return nil, &apiError{err: errors.New("invalid path"), code: 404}
+			return nil, &apiError{
+				err:  errors.New("invalid path"),
+				code: 404,
+			}
 		}
+
 		return nil, &apiError{err: err}
 	}
+
 	count := 0
 
 	if len(res) > 0 {
 		count = res[0].Total
 	}
 
-	files := utils.Map(res, func(item fileResponse) api.File { return *mapper.ToFileOut(item.File) })
+	files := utils.Map(
+		res,
+		func(item fileResponse) api.File {
+			return *mapper.ToFileOut(item.File)
+		},
+	)
 
-	return &api.FileList{Items: files,
-		Meta: api.Meta{Count: count,
+	return &api.FileList{
+		Items: files,
+		Meta: api.Meta{
+			Count:       count,
 			TotalPages:  int(math.Ceil(float64(count) / float64(filesQuery.Limit.Value))),
-			CurrentPage: filesQuery.Page.Value}}, nil
+			CurrentPage: filesQuery.Page.Value,
+		},
+	}, nil
 }
 
-func (afb *fileQueryBuilder) applyListFilters(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {
+func (afb *fileQueryBuilder) applyListFilters(
+	query *gorm.DB,
+	filesQuery *api.FilesListParams,
+	userId int64,
+) *gorm.DB {
+
 	if filesQuery.Path.Value != "" && filesQuery.ParentId.Value == "" {
 		id, err := resolvePathID(afb.db, filesQuery.Path.Value, userId)
 		if err != nil {
 			return query.Where("1 = 0")
 		}
+
 		if id == nil {
 			query = query.Where("parent_id IS NULL")
 		} else {
 			query = query.Where("parent_id = ?", *id)
 		}
 	}
+
 	if filesQuery.ParentId.Value != "" {
 		if filesQuery.ParentId.Value == "nil" {
 			query = query.Where("parent_id IS NULL")
@@ -83,14 +126,25 @@ func (afb *fileQueryBuilder) applyListFilters(query *gorm.DB, filesQuery *api.Fi
 			query = query.Where("parent_id = ?", filesQuery.ParentId.Value)
 		}
 	}
+
 	return query
 }
 
-func (afb *fileQueryBuilder) applyFindFilters(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) (*gorm.DB, error) {
+func (afb *fileQueryBuilder) applyFindFilters(
+	query *gorm.DB,
+	filesQuery *api.FilesListParams,
+	userId int64,
+) (*gorm.DB, error) {
+
 	var err error
-	if filesQuery.DeepSearch.Value && filesQuery.Query.Value != "" && filesQuery.Path.Value != "" {
-		query = query.Where("files.id in (select id  from subdirs)")
+
+	if filesQuery.DeepSearch.Value &&
+		filesQuery.Query.Value != "" &&
+		filesQuery.Path.Value != "" {
+
+		query = query.Where("files.id in (select id from subdirs)")
 	}
+
 	if filesQuery.UpdatedAt.Value != "" {
 		query, err = afb.applyDateFilters(query, filesQuery.UpdatedAt.Value)
 		if err != nil {
@@ -109,7 +163,12 @@ func (afb *fileQueryBuilder) applyFindFilters(query *gorm.DB, filesQuery *api.Fi
 	return query, nil
 }
 
-func (afb *fileQueryBuilder) applyFileSpecificFilters(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {
+func (afb *fileQueryBuilder) applyFileSpecificFilters(
+	query *gorm.DB,
+	filesQuery *api.FilesListParams,
+	userId int64,
+) *gorm.DB {
+
 	if filesQuery.Name.Value != "" {
 		query = query.Where("name = ?", filesQuery.Name.Value)
 	}
@@ -120,14 +179,17 @@ func (afb *fileQueryBuilder) applyFileSpecificFilters(query *gorm.DB, filesQuery
 		} else {
 			query = query.Where("parent_id = ?", filesQuery.ParentId.Value)
 		}
-
 	}
 
-	if filesQuery.ParentId.Value == "" && filesQuery.Path.Value != "" && filesQuery.Query.Value == "" {
+	if filesQuery.ParentId.Value == "" &&
+		filesQuery.Path.Value != "" &&
+		filesQuery.Query.Value == "" {
+
 		id, err := resolvePathID(afb.db, filesQuery.Path.Value, userId)
 		if err != nil {
 			return query.Where("1 = 0")
 		}
+
 		if id == nil {
 			query = query.Where("parent_id IS NULL")
 		} else {
@@ -140,62 +202,99 @@ func (afb *fileQueryBuilder) applyFileSpecificFilters(query *gorm.DB, filesQuery
 	}
 
 	if filesQuery.Shared.Value {
-		query = query.Where("id in (SELECT file_id FROM teldrive.file_shares where user_id = ?)", userId)
+		query = query.Where(
+			"id in (SELECT file_id FROM teldrive.file_shares where user_id = ?)",
+			userId,
+		)
 	}
 
 	return query
 }
 
-func (afb *fileQueryBuilder) applyDateFilters(query *gorm.DB, dateFilters string) (*gorm.DB, error) {
+func (afb *fileQueryBuilder) applyDateFilters(
+	query *gorm.DB,
+	dateFilters string,
+) (*gorm.DB, error) {
+
 	dateFiltersArr := strings.SplitSeq(dateFilters, ",")
+
 	for dateFilter := range dateFiltersArr {
 		query = afb.applySingleDateFilter(query, dateFilter)
 	}
+
 	return query, nil
 }
 
-func (afb *fileQueryBuilder) applySingleDateFilter(query *gorm.DB, dateFilter string) *gorm.DB {
+func (afb *fileQueryBuilder) applySingleDateFilter(
+	query *gorm.DB,
+	dateFilter string,
+) *gorm.DB {
+
 	parts := strings.Split(dateFilter, ":")
+
 	if len(parts) != 2 {
 		return query
 	}
+
 	op, date := parts[0], parts[1]
+
 	t, err := time.Parse(time.DateOnly, date)
 	if err != nil {
 		return query
 	}
 
 	formattedDate := t.Format(time.RFC3339)
+
 	switch op {
 	case "gte":
 		query = query.Where("updated_at >= ?", formattedDate)
+
 	case "lte":
 		query = query.Where("updated_at <= ?", formattedDate)
+
 	case "eq":
 		query = query.Where("updated_at = ?", formattedDate)
+
 	case "gt":
 		query = query.Where("updated_at > ?", formattedDate)
+
 	case "lt":
 		query = query.Where("updated_at < ?", formattedDate)
 	}
+
 	return query
 }
 
-func (afb *fileQueryBuilder) applySearchQuery(query *gorm.DB, filesQuery *api.FilesListParams) *gorm.DB {
+func (afb *fileQueryBuilder) applySearchQuery(
+	query *gorm.DB,
+	filesQuery *api.FilesListParams,
+) *gorm.DB {
+
 	switch filesQuery.SearchType.Value {
 	case api.FileQuerySearchTypeText:
-		query = query.Where("teldrive.clean_name(name) &@~ teldrive.clean_name(?)", filesQuery.Query.Value)
+		query = query.Where(
+			"teldrive.clean_name(name) &@~ teldrive.clean_name(?)",
+			filesQuery.Query.Value,
+		)
+
 	case api.FileQuerySearchTypeRegex:
 		query = query.Where("name &~ ?", filesQuery.Query.Value)
 	}
+
 	return query
 }
 
-func (afb *fileQueryBuilder) applyCategoryFilter(query *gorm.DB, categories []api.Category) *gorm.DB {
+func (afb *fileQueryBuilder) applyCategoryFilter(
+	query *gorm.DB,
+	categories []api.Category,
+) *gorm.DB {
+
 	if len(categories) == 0 {
 		return query
 	}
+
 	var filterQuery *gorm.DB
+
 	if categories[0] == folderCategory {
 		filterQuery = afb.db.Where("type = ?", categories[0])
 	} else {
@@ -211,33 +310,77 @@ func (afb *fileQueryBuilder) applyCategoryFilter(query *gorm.DB, categories []ap
 			}
 		}
 	}
+
 	return query.Where(filterQuery)
 }
 
-func (afb *fileQueryBuilder) buildFileQuery(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {
+/*
+   ==========================
+   FIXED buildFileQuery()
+   ==========================
+*/
+
+func (afb *fileQueryBuilder) buildFileQuery(
+	query *gorm.DB,
+	filesQuery *api.FilesListParams,
+	userId int64,
+) *gorm.DB {
+
 	orderField := getValidSortField(filesQuery.Sort.Value)
 	orderDir := getValidOrderDirection(filesQuery.Order.Value)
 	op := getOrderOperation(filesQuery)
 
-	return afb.buildSubqueryCTE(query, filesQuery, userId).Clauses(exclause.NewWith("ranked_scores", afb.db.Model(&models.File{}).Select(orderField, "count(*) OVER () as total",
-		fmt.Sprintf("ROW_NUMBER() OVER (ORDER BY %s %s) AS rank", orderField, orderDir)).
-		Where(query))).Model(&models.File{}).
-		Select(selectedFields, "(select total from ranked_scores limit 1) as total").
-		Where(fmt.Sprintf("%s %s (SELECT %s FROM ranked_scores WHERE rank = ?)", orderField, op, orderField),
-			max((filesQuery.Page.Value-1)*filesQuery.Limit.Value, 1)).
-		Where(query).Order(getOrder(filesQuery)).Limit(filesQuery.Limit.Value)
+	baseQuery := afb.buildSubqueryCTE(query, filesQuery, userId)
+
+	rankedQuery := afb.db.
+		Session(&gorm.Session{NewDB: true}).
+		Model(&models.File{}).
+		Select(
+			orderField,
+			"count(*) OVER () as total",
+			fmt.Sprintf(
+				"ROW_NUMBER() OVER (ORDER BY %s %s) AS rank",
+				orderField,
+				orderDir,
+			),
+		).
+		Where(query)
+
+	return baseQuery.
+		Clauses(exclause.NewWith("ranked_scores", rankedQuery)).
+		Model(&models.File{}).
+		Select(
+			selectedFields,
+			"(select total from ranked_scores limit 1) as total",
+		).
+		Where(
+			fmt.Sprintf(
+				"%s %s (SELECT %s FROM ranked_scores WHERE rank = ?)",
+				orderField,
+				op,
+				orderField,
+			),
+			max((filesQuery.Page.Value-1)*filesQuery.Limit.Value, 1),
+		).
+		Where(query).
+		Order(getOrder(filesQuery)).
+		Limit(filesQuery.Limit.Value)
 }
 
 func getValidSortField(sort api.FileQuerySort) string {
 	switch sort {
 	case api.FileQuerySortName:
 		return "name"
+
 	case api.FileQuerySortUpdatedAt:
 		return "updated_at"
+
 	case api.FileQuerySortSize:
 		return "size"
+
 	case api.FileQuerySortID:
 		return "id"
+
 	default:
 		return "updated_at"
 	}
@@ -247,37 +390,87 @@ func getValidOrderDirection(order api.FileQueryOrder) string {
 	switch order {
 	case api.FileQueryOrderAsc:
 		return "ASC"
+
 	case api.FileQueryOrderDesc:
 		return "DESC"
+
 	default:
 		return "DESC"
 	}
 }
 
-func (afb *fileQueryBuilder) buildSubqueryCTE(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {
-	if filesQuery.DeepSearch.Value && filesQuery.Query.Value != "" && filesQuery.Path.Value != "" {
-		id, _ := resolvePathID(afb.db, filesQuery.Path.Value, userId)
+/*
+   ==========================
+   FIXED buildSubqueryCTE()
+   ==========================
+*/
+
+func (afb *fileQueryBuilder) buildSubqueryCTE(
+	query *gorm.DB,
+	filesQuery *api.FilesListParams,
+	userId int64,
+) *gorm.DB {
+
+	if filesQuery.DeepSearch.Value &&
+		filesQuery.Query.Value != "" &&
+		filesQuery.Path.Value != "" {
+
+		id, err := resolvePathID(
+			afb.db,
+			filesQuery.Path.Value,
+			userId,
+		)
+
+		if err != nil {
+			return afb.db.Where("1 = 0")
+		}
+
 		var whereClause string
 		var args []any
+
 		if id == nil {
 			whereClause = "parent_id IS NULL"
 		} else {
 			whereClause = "id = ?"
 			args = []any{*id}
 		}
-		return afb.db.Clauses(exclause.With{Recursive: true, CTEs: []exclause.CTE{{Name: "subdirs",
-			Subquery: exclause.Subquery{DB: afb.db.Model(&models.File{}).Select("id", "parent_id").
-				Where(whereClause, args...).
-				Clauses(exclause.NewUnion("ALL ?",
-					afb.db.Table("teldrive.files as f").Select("f.id", "f.parent_id").
-						Joins("inner join subdirs ON f.parent_id = subdirs.id")))}}}})
+
+		return afb.db.Clauses(
+			exclause.With{
+				Recursive: true,
+				CTEs: []exclause.CTE{
+					{
+						Name: "subdirs",
+						Subquery: exclause.Subquery{
+							DB: afb.db.
+								Model(&models.File{}).
+								Select("id", "parent_id").
+								Where(whereClause, args...).
+								Clauses(
+									exclause.NewUnion(
+										"ALL ?",
+										afb.db.
+											Table("teldrive.files as f").
+											Select("f.id", "f.parent_id").
+											Joins(
+												"inner join subdirs ON f.parent_id = subdirs.id",
+											),
+									),
+								),
+						},
+					},
+				},
+			},
+		)
 	}
+
 	return query
 }
 
 func getOrder(filesQuery *api.FilesListParams) string {
 	orderField := getValidSortField(filesQuery.Sort.Value)
 	orderDir := getValidOrderDirection(filesQuery.Order.Value)
+
 	return fmt.Sprintf("%s %s", orderField, orderDir)
 }
 
@@ -285,14 +478,13 @@ func getOrderOperation(filesQuery *api.FilesListParams) string {
 	if filesQuery.Page.Value == 1 {
 		if filesQuery.Order.Value == api.FileQueryOrderAsc {
 			return ">="
-		} else {
-			return "<="
 		}
-	} else {
-		if filesQuery.Order.Value == api.FileQueryOrderAsc {
-			return ">"
-		} else {
-			return "<"
-		}
+		return "<="
 	}
+
+	if filesQuery.Order.Value == api.FileQueryOrderAsc {
+		return ">"
+	}
+
+	return "<"
 }
