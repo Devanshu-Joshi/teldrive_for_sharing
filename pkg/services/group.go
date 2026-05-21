@@ -68,21 +68,34 @@ func (e *extendedService) authenticateUser(w http.ResponseWriter, r *http.Reques
 	return ctx, userId, nil
 }
 
-// verifyChannelAccess checks if the user's personal Telegram session has access to the channel ID.
-func (e *extendedService) verifyChannelAccess(ctx context.Context, channelId int64) bool {
+// getReadableChannelTitle verifies the user can READ the channel and returns its title.
+// IMPORTANT: This must NOT require admin/write permissions (readonly channels are allowed).
+func (e *extendedService) getReadableChannelTitle(ctx context.Context, channelId int64) (string, error) {
 	claims := auth.GetJWTUser(ctx)
 	if claims == nil || claims.TgSession == "" {
-		return false
+		return "", fmt.Errorf("missing telegram session")
 	}
 	client, err := tgc.AuthClient(ctx, &e.api.cnf.TG, claims.TgSession, e.api.newMiddlewares(ctx, 5)...)
 	if err != nil {
-		return false
+		return "", err
 	}
+
+	var title string
 	err = tgc.RunWithAuth(ctx, client, "", func(ctx context.Context) error {
-		_, err := tgc.GetChannelById(ctx, client.API(), channelId)
-		return err
+		ch, err := tgc.GetChannelFull(ctx, client.API(), channelId)
+		if err != nil {
+			return err
+		}
+		title = ch.Title
+		return nil
 	})
-	return err == nil
+	if err != nil {
+		return "", err
+	}
+	if title == "" {
+		title = "Unknown Channel"
+	}
+	return title, nil
 }
 
 // HandleGroupRoute intercepts and routes group management API requests.
@@ -147,16 +160,23 @@ func (e *extendedService) GetChannelInfo(w http.ResponseWriter, r *http.Request,
 	channelId, err := e.api.channelManager.CurrentChannel(ctx, userId)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "No default channel configured"}`))
+		if errors.Is(err, tgc.ErrNoDefaultChannel) {
+			w.Write([]byte(`{"error": "No default storage channel configured."}`))
+			return
+		}
+		w.Write([]byte(`{"error": "` + err.Error() + `"}`))
 		return
 	}
 
-	var channel models.Channel
-	var channelName string
-	if err := e.api.db.Where("channel_id = ?", channelId).First(&channel).Error; err == nil {
-		channelName = channel.ChannelName
-	} else {
-		channelName = "Unknown Channel"
+	channelName, tgErr := e.getReadableChannelTitle(ctx, channelId)
+	if tgErr != nil {
+		// Fallback to DB if Telegram lookup fails.
+		var channel models.Channel
+		if err := e.api.db.Where("channel_id = ?", channelId).First(&channel).Error; err == nil && channel.ChannelName != "" {
+			channelName = channel.ChannelName
+		} else {
+			channelName = "Unknown Channel"
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -168,7 +188,7 @@ func (e *extendedService) GetChannelInfo(w http.ResponseWriter, r *http.Request,
 
 func (e *extendedService) GetGroupStatus(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
 	cap := e.api.ValidateSharedCapability(ctx, userId)
-	
+
 	var hostCount int64
 	e.api.db.Model(&models.GroupMember{}).Where("status = 'host'").Count(&hostCount)
 	hostExists := hostCount > 0
@@ -188,12 +208,17 @@ func (e *extendedService) ClaimHost(w http.ResponseWriter, r *http.Request, ctx 
 	channelId, err := e.api.channelManager.CurrentChannel(ctx, userId)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "You must set a default storage channel first"}`))
+		if errors.Is(err, tgc.ErrNoDefaultChannel) {
+			w.Write([]byte(`{"error": "No default storage channel configured."}`))
+			return
+		}
+		w.Write([]byte(`{"error": "` + err.Error() + `"}`))
 		return
 	}
 
-	// Verify Telegram Channel Access using the user's client session
-	if !e.verifyChannelAccess(ctx, channelId) {
+	// Read-only access validation + authoritative channel name fetch
+	channelName, err := e.getReadableChannelTitle(ctx, channelId)
+	if err != nil {
 		w.WriteHeader(http.StatusForbidden)
 		w.Write([]byte(`{"error": "You do not have access to this Telegram Channel or session is invalid"}`))
 		return
@@ -219,11 +244,12 @@ func (e *extendedService) ClaimHost(w http.ResponseWriter, r *http.Request, ctx 
 		doubleHash := crypt.ComputeGroupHash(fingerprint, groupSecret)
 
 		newHost := &models.GroupMember{
-			HostID:     userId,
-			MemberID:   userId,
-			Status:     "host",
-			StoredHash: &doubleHash,
-			ChannelID:  &channelId,
+			HostID:      userId,
+			MemberID:    userId,
+			Status:      "host",
+			StoredHash:  &doubleHash,
+			ChannelID:   &channelId,
+			ChannelName: &channelName,
 		}
 
 		return tx.Create(newHost).Error
@@ -245,6 +271,8 @@ func (e *extendedService) ClaimHost(w http.ResponseWriter, r *http.Request, ctx 
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":      "Success",
 		"groupSecret": groupSecret,
+		"channelId":   channelId,
+		"channelName": channelName,
 	})
 }
 
@@ -294,15 +322,15 @@ func (e *extendedService) RequestAccess(w http.ResponseWriter, r *http.Request, 
 		if host.ChannelID == nil {
 			return newHttpError(http.StatusBadRequest, "host's Telegram channel is invalid/missing")
 		}
-		if !e.verifyChannelAccess(ctx, *host.ChannelID) {
-			return newHttpError(http.StatusForbidden, "you do not have access to the Host's required Telegram Channel")
+		if _, err := e.getReadableChannelTitle(ctx, *host.ChannelID); err != nil {
+			return newHttpError(http.StatusForbidden, "Cannot join shared workspace because host channel is not accessible.")
 		}
 
 		// 5. Verify cryptographic compatibility safely
 		if host.StoredHash == nil {
 			return newHttpError(http.StatusBadRequest, "host has no cryptographic fingerprint stored")
 		}
-		
+
 		fingerprint := crypt.GetCryptoFingerprint(e.api.cnf.TG.Uploads.EncryptionKey)
 		calculatedDoubleHash := crypt.ComputeGroupHash(fingerprint, groupSecret)
 		if *host.StoredHash != calculatedDoubleHash {
@@ -342,7 +370,7 @@ type ManageRequest struct {
 // ManageGuest handles POST /api/group/manage - Host approves or rejects a pending guest.
 func (e *extendedService) ManageGuest(w http.ResponseWriter, r *http.Request, ctx context.Context, userId int64) {
 	var req ManageRequest
-	
+
 	// Support JSON parsing
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		// Fallback to parsing from PostForm values if JSON decoding fails

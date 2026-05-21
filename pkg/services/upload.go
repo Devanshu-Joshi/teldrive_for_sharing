@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -196,6 +197,9 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 
 	channelId := params.ChannelId.Value
 	if cap.Valid && intendedHostChannelId != 0 {
+		if params.ChannelId.Value != 0 && params.ChannelId.Value != intendedHostChannelId {
+			return nil, &apiError{err: errors.New("cannot upload to a different channel while shared workspace is active"), code: http.StatusForbidden}
+		}
 		channelId = intendedHostChannelId
 	} else if channelId == 0 {
 		var err error
@@ -297,6 +301,10 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	})
 
 	if err != nil {
+		if cap.Valid && intendedHostChannelId != 0 && isChannelAccessError(err) {
+			logger.Warn("shared.channel_inaccessible", zap.Int64("channel_id", channelId), zap.Error(err))
+			return nil, &apiError{err: errors.New(sharedChannelInaccessibleMessage), code: http.StatusForbidden}
+		}
 		logger.Error("upload.failed", zap.String("file_name", params.FileName),
 			zap.String("part_name", params.PartName),
 			zap.Int("part_no", params.PartNo), zap.Error(err))

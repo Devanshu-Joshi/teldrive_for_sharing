@@ -86,9 +86,12 @@ func (a *apiService) UsersListChannels(ctx context.Context) ([]api.Channel, erro
 func (a *apiService) UsersCreateChannel(ctx context.Context, req *api.Channel) error {
 	userID := auth.GetUser(ctx)
 
-	// EPIC X: Immutable topology — block channel changes for active host
-	if a.cnf.Shared.IsShared && a.isActiveHost(userID) {
-		return &apiError{err: errors.New("cannot create storage channel while shared workspace is active"), code: 403}
+	// Immutable topology — block channel creation while shared channel authority is active.
+	if a.cnf.Shared.IsShared {
+		cap := a.ValidateSharedCapability(ctx, userID)
+		if cap.Valid && (cap.Role == "host" || cap.Role == "approved") {
+			return &apiError{err: errors.New("cannot create storage channel while shared workspace is active"), code: 403}
+		}
 	}
 
 	_, err := a.channelManager.CreateNewChannel(ctx, req.ChannelName, userID, false)
@@ -297,7 +300,7 @@ func (a *apiService) UsersStats(ctx context.Context) (*api.UserConfig, error) {
 		err       error
 	)
 
-	channelId, err = a.channelManager.CurrentChannel(ctx, userId)
+	channelId, err = a.storageChannelID(ctx, userId)
 	if err != nil {
 		channelId = 0
 	}
@@ -313,9 +316,12 @@ func (a *apiService) UsersStats(ctx context.Context) (*api.UserConfig, error) {
 func (a *apiService) UsersUpdateChannel(ctx context.Context, req *api.ChannelUpdate) error {
 	userId := auth.GetUser(ctx)
 
-	// EPIC X: Immutable topology — block channel changes for active host
-	if a.cnf.Shared.IsShared && a.isActiveHost(userId) {
-		return &apiError{err: errors.New("cannot modify storage channel while shared workspace is active"), code: 403}
+	// Immutable topology — block default channel changes while shared channel authority is active.
+	if a.cnf.Shared.IsShared {
+		cap := a.ValidateSharedCapability(ctx, userId)
+		if cap.Valid && (cap.Role == "host" || cap.Role == "approved") {
+			return &apiError{err: errors.New("cannot modify storage channel while shared workspace is active"), code: 403}
+		}
 	}
 
 	channel := &models.Channel{UserId: userId, Selected: true}

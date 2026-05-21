@@ -44,6 +44,31 @@ var (
 	defaultContentType   = "application/octet-stream"
 )
 
+const peerSharedChannelVisibilitySQL = `(
+	(type = 'file' AND channel_id = ?)
+	OR
+	(type = 'folder' AND EXISTS (
+		WITH RECURSIVE subtree AS (
+			SELECT id, parent_id, type, channel_id
+			FROM teldrive.files
+			WHERE parent_id = files.id
+				AND status = files.status
+				AND user_id = files.user_id
+			UNION ALL
+			SELECT f.id, f.parent_id, f.type, f.channel_id
+			FROM teldrive.files f
+			JOIN subtree s ON f.parent_id = s.id
+			WHERE f.status = files.status
+				AND f.user_id = files.user_id
+		)
+		SELECT 1
+		FROM subtree s
+		WHERE s.type = 'file'
+			AND s.channel_id = ?
+		LIMIT 1
+	))
+)`
+
 func isUUID(str string) bool {
 	_, err := uuid.Parse(str)
 	return err == nil
@@ -64,7 +89,10 @@ func (a *apiService) FilesCategoryStats(ctx context.Context) ([]api.CategoryStat
 func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params api.FilesCopyParams) (*api.File, error) {
 	userId := auth.GetUser(ctx)
 
-	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.newMiddlewares(ctx, 5)...)
+	client, err := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.newMiddlewares(ctx, 5)...)
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
 
 	var res []models.File
 
@@ -77,9 +105,40 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 
 	file := res[0]
 
+	cap := a.ValidateSharedCapability(ctx, userId)
+	if file.UserId != userId {
+		if !cap.Valid {
+			return nil, &apiError{err: errors.New(cap.Reason), code: 403}
+		}
+		var callerHostID int64
+		switch cap.Role {
+		case "host":
+			callerHostID = userId
+		case "approved":
+			var callerMember models.GroupMember
+			if err := a.db.Where("member_id = ? AND status = 'approved'", userId).First(&callerMember).Error; err != nil {
+				return nil, &apiError{err: errors.New("caller is not an approved member"), code: 403}
+			}
+			callerHostID = callerMember.HostID
+		default:
+			return nil, &apiError{err: errors.New("unauthorized role"), code: 403}
+		}
+
+		var targetMember models.GroupMember
+		if err := a.db.Where("member_id = ? AND status IN ('host', 'approved')", file.UserId).First(&targetMember).Error; err != nil {
+			return nil, &apiError{err: errors.New("target not found in group"), code: 404}
+		}
+		if callerHostID != targetMember.HostID {
+			return nil, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
+		}
+		if cap.ChannelID == nil || file.ChannelId == nil || *file.ChannelId != *cap.ChannelID {
+			return nil, &apiError{err: errors.New("file not found"), code: 404}
+		}
+	}
+
 	newIds := []api.Part{}
 
-	channelId, err := a.channelManager.CurrentChannel(ctx, userId)
+	channelId, err := a.storageChannelID(ctx, userId)
 	if err != nil {
 		return nil, &apiError{err: err}
 	}
@@ -139,6 +198,11 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 	})
 
 	if err != nil {
+		if isChannelAccessError(err) {
+			if cap.Valid && cap.ChannelID != nil && file.ChannelId != nil && *file.ChannelId == *cap.ChannelID {
+				return nil, &apiError{err: errors.New(sharedChannelInaccessibleMessage), code: http.StatusForbidden}
+			}
+		}
 		return nil, &apiError{err: err}
 	}
 
@@ -342,25 +406,16 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 		fileDB.Parts = nil
 	case api.FileTypeFile:
 		if fileIn.ChannelId.Value == 0 {
-			channelId, err = a.channelManager.CurrentChannel(ctx, userId)
+			channelId, err = a.storageChannelID(ctx, userId)
 			if err != nil {
 				return nil, &apiError{err: err}
 			}
 		} else {
-			channelId = fileIn.ChannelId.Value
-		}
-
-		// Phase 21B: Explicitly overwrite ChannelID with Host channel ID if upload is virtualized
-		if isVirtual {
-			var hostChannelId int64
-			err := a.db.Model(&models.GroupMember{}).
-				Select("channel_id").
-				Where("member_id = ? AND status = 'host'", hostID).
-				Row().
-				Scan(&hostChannelId)
-			if err == nil && hostChannelId != 0 {
-				channelId = hostChannelId
+			cap := a.ValidateSharedCapability(ctx, userId)
+			if cap.Valid && cap.ChannelID != nil && (cap.Role == "host" || cap.Role == "approved") && fileIn.ChannelId.Value != *cap.ChannelID {
+				return nil, &apiError{err: errors.New("cannot create file in a different channel while shared workspace is active"), code: 403}
 			}
+			channelId = fileIn.ChannelId.Value
 		}
 
 		fileDB.ChannelId = &channelId
@@ -389,7 +444,7 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 					return nil, &apiError{err: errors.New("invalid part: part_id cannot be zero"), code: 400}
 				}
 			}
-			
+
 			// Convert uploads to parts
 			for _, upload := range uploads {
 				parts = append(parts, api.Part{
@@ -788,10 +843,12 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 
 		// Translate path and set effective user ID
 		params.Path.SetTo(subpath)
-		userId = targetUserID
+		if cap.ChannelID == nil {
+			return nil, &apiError{err: errors.New("host channel is missing"), code: 500}
+		}
 
-		queryBuilder := &fileQueryBuilder{db: a.db}
-		res, err := queryBuilder.execute(&params, userId)
+		queryBuilder := &fileQueryBuilder{db: a.db.Where(peerSharedChannelVisibilitySQL, *cap.ChannelID, *cap.ChannelID)}
+		res, err := queryBuilder.execute(&params, targetUserID)
 		if err != nil {
 			return nil, err
 		}
@@ -1046,9 +1103,12 @@ func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) 
 				if callerHostID != targetHostID {
 					return nil, &apiError{err: errors.New("unauthorized: users are not in the same shared group"), code: 403}
 				}
+				if cap.ChannelID == nil {
+					return nil, &apiError{err: errors.New("host channel is missing"), code: 500}
+				}
 
 				// Delegate directory query execution to GORM query builder under the host's context.
-				queryBuilder := &fileQueryBuilder{db: a.db}
+				queryBuilder := &fileQueryBuilder{db: a.db.Where(peerSharedChannelVisibilitySQL, *cap.ChannelID, *cap.ChannelID)}
 				return queryBuilder.execute(&params, parentFolder.UserId)
 			}
 		}
@@ -1566,6 +1626,12 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			http.Error(w, "unauthorized: users are not in the same shared group", http.StatusForbidden)
 			return
 		}
+
+		// Strict peer visibility: only allow access to files stored in the authoritative shared channel.
+		if cap.ChannelID == nil || file.ChannelId == nil || *file.ChannelId != *cap.ChannelID {
+			http.Error(w, "file not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	w.Header().Set("Accept-Ranges", "bytes")
@@ -1693,7 +1759,12 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			if err != nil {
 				if isChannelAccessError(err) {
 					logger.Warn("stream.channel_inaccessible", zap.Error(err))
-					http.Error(w, "stream channel inaccessible: "+err.Error(), http.StatusForbidden)
+					cap := e.api.ValidateSharedCapability(ctx, session.UserId)
+					if cap.Valid && cap.ChannelID != nil && file.ChannelId != nil && *file.ChannelId == *cap.ChannelID {
+						http.Error(w, sharedChannelInaccessibleMessage, http.StatusForbidden)
+					} else {
+						http.Error(w, "stream channel inaccessible: "+err.Error(), http.StatusForbidden)
+					}
 					return nil
 				}
 				logger.Error("stream.parts_fetch_failed", zap.Error(err))
@@ -1715,7 +1786,12 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			if err != nil {
 				if isChannelAccessError(err) {
 					logger.Warn("stream.channel_inaccessible", zap.Error(err))
-					http.Error(w, "stream channel inaccessible: "+err.Error(), http.StatusForbidden)
+					cap := e.api.ValidateSharedCapability(ctx, session.UserId)
+					if cap.Valid && cap.ChannelID != nil && file.ChannelId != nil && *file.ChannelId == *cap.ChannelID {
+						http.Error(w, sharedChannelInaccessibleMessage, http.StatusForbidden)
+					} else {
+						http.Error(w, "stream channel inaccessible: "+err.Error(), http.StatusForbidden)
+					}
 					return nil
 				}
 				logger.Error("stream.reader_create_failed", zap.Error(err))
